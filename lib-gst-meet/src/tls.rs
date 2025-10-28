@@ -18,7 +18,7 @@ pub(crate) fn wss_connector(insecure: bool) -> Result<tokio_tungstenite::Connect
     roots.add(cert).context("failed to add native root certs")?;
   }
 
-  let mut config = rustls::ClientConfig::builder()
+  let config = rustls::ClientConfig::builder()
     .with_root_certificates(roots)
     .with_no_client_auth();
   #[cfg(feature = "tls-insecure")]

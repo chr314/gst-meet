@@ -198,7 +198,7 @@ impl Connection {
       }
       #[cfg(not(feature = "syntax-highlighting"))]
       debug!("XMPP    >>> {}", xml);
-      sink.send(Message::Text(xml)).await?;
+      sink.send(Message::Text(xml.into())).await?;
     }
     Ok(())
   }

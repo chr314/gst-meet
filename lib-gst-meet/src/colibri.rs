@@ -120,7 +120,7 @@ impl ColibriChannel {
         match serde_json::to_string(&colibri_msg) {
           Ok(json) => {
             debug!("Colibri >>> {}", json);
-            let msg = Message::Text(json);
+            let msg = Message::Text(json.into());
             colibri_sink.send(msg).await?;
           },
           Err(e) => warn!("failed to serialise colibri message: {:?}", e),

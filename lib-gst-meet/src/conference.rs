@@ -6,9 +6,8 @@ use anyhow::{anyhow, bail, Context, Result};
 use async_trait::async_trait;
 use colibri::{ColibriMessage, JsonMessage};
 use futures::stream::StreamExt;
-use glib::object::ObjectExt as _;
 use gstreamer::prelude::{
-  ElementExt as _, ElementExtManual as _, GstBinExt as _, GstBinExtManual as _,
+  ElementExt as _, ElementExtManual as _, GstBinExt as _, GstBinExtManual as _, ObjectExt as _,
 };
 use jid::{BareJid, FullJid, Jid};
 use jitsi_xmpp_parsers::jingle::{Action, Jingle};

@@ -1,15 +1,14 @@
-use std::{collections::HashMap, fmt, net::SocketAddr};
+use std::{collections::HashMap, fmt, net::SocketAddr, ops::ControlFlow};
 
 use anyhow::{anyhow, bail, Context, Result};
 use futures::stream::StreamExt as _;
 use glib::{
-  object::ObjectExt as _,
   prelude::{Cast as _, ToValue as _},
 };
 use gstreamer::{
   prelude::{
     ElementExt as _, ElementExtManual as _, GObjectExtManualGst as _, GstBinExt as _,
-    GstBinExtManual as _, GstObjectExt as _, PadExt as _,
+    GstBinExtManual as _, GstObjectExt as _, ObjectExt as _, PadExt as _,
   },
   Bin, GhostPad,
 };
@@ -197,7 +196,7 @@ impl JingleSession {
             }
           }
         }
-        true
+        ControlFlow::Continue(())
       });
     }
   }
@@ -1135,7 +1134,7 @@ impl JingleSession {
     };
     audio_sink_element.set_property("min-ptime", 10i64 * 1000 * 1000);
     audio_sink_element.set_property("ssrc", audio_ssrc);
-    if audio_sink_element.has_property("auto-header-extension", None) {
+    if audio_sink_element.has_property("auto-header-extension") {
       audio_sink_element.set_property("auto-header-extension", false);
       audio_sink_element.connect("request-extension", false, move |values| {
         let f = || {
@@ -1181,7 +1180,7 @@ impl JingleSession {
       bail!("unsupported video codec: {}", codec_name);
     };
     video_sink_element.set_property("ssrc", video_ssrc);
-    if video_sink_element.has_property("auto-header-extension", None) {
+    if video_sink_element.has_property("auto-header-extension") {
       video_sink_element.set_property("auto-header-extension", false);
       video_sink_element.connect("request-extension", false, move |values| {
         let f = || {
