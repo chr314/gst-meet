@@ -1062,17 +1062,30 @@ impl JingleSession {
               let sink_pad = sink_element
                 .request_pad_simple("sink_%u")
                 .context("no suitable sink pad provided by sink element in recv pipeline")?;
-              let ghost_pad = GhostPad::builder_with_target(&sink_pad)?
-                .name(format!(
-                  "participant_{}_{:?}",
-                  participant_id, source.media_type
-                ))
-                .build();
+              let pad_name = format!(
+                "participant_{}_{:?}",
+                participant_id, source.media_type
+              );
               let bin: Bin = sink_element
                 .parent()
                 .context("sink element has no parent")?
                 .downcast()
                 .map_err(|_| anyhow!("sink element's parent is not a bin"))?;
+
+              // If a ghost pad with this name already exists (e.g. participant SSRC changed),
+              // remove the old one before adding the new one.
+              if let Some(old_pad) = bin.static_pad(&pad_name) {
+                debug!(
+                  "removing existing ghost pad {} before re-adding",
+                  pad_name
+                );
+                old_pad.set_active(false).ok();
+                let _ = bin.remove_pad(&old_pad);
+              }
+
+              let ghost_pad = GhostPad::builder_with_target(&sink_pad)?
+                .name(&pad_name)
+                .build();
               bin.add_pad(&ghost_pad)?;
 
               src_pad
@@ -1089,6 +1102,15 @@ impl JingleSession {
                 MediaType::Video => "video",
               };
               if let Some(sink_pad) = participant_bin.static_pad(sink_pad_name) {
+                // If the sink pad is already linked (e.g. participant SSRC changed),
+                // unlink the old peer before linking the new one.
+                if let Some(old_peer) = sink_pad.peer() {
+                  debug!(
+                    "unlinking existing peer from {} sink pad before re-linking",
+                    sink_pad_name
+                  );
+                  old_peer.unlink(&sink_pad)?;
+                }
                 src_pad.link(&sink_pad).context(
                   "failed to link decode chain to participant bin from recv participant pipeline",
                 )?;
