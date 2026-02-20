@@ -16,8 +16,26 @@ use glib::ffi::{gboolean, gconstpointer, gpointer, GType};
 #[allow(unused_imports)]
 use libc::{
   c_char, c_double, c_float, c_int, c_long, c_short, c_uchar, c_uint, c_ulong, c_ushort, c_void,
-  intptr_t, size_t, sockaddr, sockaddr_in, sockaddr_in6, ssize_t, time_t, uintptr_t, FILE,
+  intptr_t, size_t, ssize_t, time_t, uintptr_t, FILE,
 };
+
+#[cfg(unix)]
+use libc::{sockaddr, sockaddr_in, sockaddr_in6};
+
+#[cfg(windows)]
+use windows_sys::Win32::Networking::WinSock::{
+  SOCKADDR, SOCKADDR_IN, SOCKADDR_IN6,
+};
+
+#[cfg(windows)]
+type sockaddr = SOCKADDR;
+
+#[cfg(windows)]
+type sockaddr_in = SOCKADDR_IN;
+
+#[cfg(windows)]
+type sockaddr_in6 = SOCKADDR_IN6;
+
 
 // Enums
 pub type NiceCandidateTransport = c_int;
