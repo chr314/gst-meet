@@ -7,7 +7,7 @@ impl ColonSeparatedHex {
   pub fn decode(s: &str) -> Result<Vec<u8>, Error> {
     let mut bytes = vec![];
     for i in 0..(1 + s.len()) / 3 {
-      let byte = u8::from_str_radix(&s[3 * i..3 * i + 2], 16)?;
+      let byte = u8::from_str_radix(&s[3 * i..3 * i + 2], 16).map_err(Error::text_parse_error)?;
       if 3 * i + 2 < s.len() {
         assert_eq!(&s[3 * i + 2..3 * i + 3], ":");
       }

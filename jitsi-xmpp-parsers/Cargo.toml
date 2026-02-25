@@ -10,9 +10,9 @@ documentation = "https://docs.rs/jitsi-xmpp-parsers/"
 authors = ["Jasper Hugo <jasper@avstack.io>"]
 
 [dependencies]
-jid = { version = "0.10", default-features = false, features = ["minidom"] }
-minidom = { version = "0.15", default-features = false }
-xmpp-parsers = { version = "0.20", default-features = false, features = ["disable-validation"] }
+jid = { version = "0.12", default-features = false, features = ["minidom"] }
+minidom = { version = "0.18", default-features = false }
+xmpp-parsers = { version = "0.22", default-features = false, features = ["disable-validation"] }
 
 [package.metadata.docs.rs]
 rustdoc-args = [ "--sort-modules-by-appearance", "-Zunstable-options" ]

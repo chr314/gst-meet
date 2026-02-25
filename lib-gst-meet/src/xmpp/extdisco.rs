@@ -1,7 +1,8 @@
 use std::convert::TryFrom;
 
 use anyhow::{bail, Context, Result};
-use xmpp_parsers::{iq::IqGetPayload, Element};
+use minidom::Element;
+use xmpp_parsers::iq::IqGetPayload;
 
 use crate::xmpp::ns;
 

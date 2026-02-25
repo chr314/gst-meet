@@ -65,8 +65,8 @@ impl TryFrom<Element> for Parameter {
 impl From<Parameter> for Element {
   fn from(parameter: Parameter) -> Element {
     Element::builder("parameter", JINGLE_SSMA)
-      .attr("name", parameter.name)
-      .attr("value", parameter.value)
+      .attr(::minidom::rxml::xml_ncname!("name").to_owned(), parameter.name)
+      .attr(::minidom::rxml::xml_ncname!("value").to_owned(), parameter.value)
       .build()
   }
 }

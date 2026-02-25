@@ -4,7 +4,9 @@ use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use tokio::{sync::mpsc, task::JoinHandle, time};
 use tracing::warn;
-use xmpp_parsers::{iq::Iq, ping::Ping, Element, FullJid, Jid};
+use jid::{FullJid, Jid};
+use minidom::Element;
+use xmpp_parsers::{iq::Iq, ping::Ping};
 
 use crate::{stanza_filter::StanzaFilter, util::generate_id};
 
@@ -46,10 +48,10 @@ impl StanzaFilter for Pinger {
   async fn take(&self, element: Element) -> Result<()> {
     let iq = Iq::try_from(element)?;
     let result_iq = Iq::empty_result(
-      iq.from.ok_or_else(|| anyhow!("iq missing from"))?,
-      iq.id.clone(),
+      iq.from().cloned().ok_or_else(|| anyhow!("iq missing from"))?,
+      iq.id().to_owned(),
     )
-    .with_from(Jid::Full(self.jid.clone()));
+    .with_from(self.jid.clone().into());
     self.tx.send(result_iq.into()).await?;
     Ok(())
   }

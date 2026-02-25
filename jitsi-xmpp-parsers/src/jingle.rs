@@ -1,6 +1,7 @@
 use std::convert::TryFrom;
 
 use jid::Jid;
+use minidom::Element;
 use xmpp_parsers::{
   iq::IqSetPayload,
   jingle::{ContentId, Creator, Disposition, ReasonElement, Senders, SessionId},
@@ -8,7 +9,7 @@ use xmpp_parsers::{
   jingle_ibb::Transport as IbbTransport,
   jingle_s5b::Transport as Socks5Transport,
   ns::{JINGLE, JINGLE_GROUPING, JINGLE_IBB, JINGLE_ICE_UDP, JINGLE_RTP, JINGLE_S5B},
-  Element, Error,
+  Error,
 };
 
 use crate::{
@@ -173,7 +174,7 @@ impl TryFrom<Element> for Jingle {
       }
       else if child.is("reason", JINGLE) {
         if jingle.reason.is_some() {
-          return Err(Error::ParseError(
+          return Err(Error::Other(
             "Jingle must not have more than one reason.",
           ));
         }
@@ -182,7 +183,7 @@ impl TryFrom<Element> for Jingle {
       }
       else if child.is("group", JINGLE_GROUPING) {
         if jingle.group.is_some() {
-          return Err(Error::ParseError(
+          return Err(Error::Other(
             "Jingle must not have more than one grouping.",
           ));
         }
@@ -201,10 +202,10 @@ impl TryFrom<Element> for Jingle {
 impl From<Jingle> for Element {
   fn from(jingle: Jingle) -> Element {
     Element::builder("jingle", JINGLE)
-      .attr("action", jingle.action)
-      .attr("initiator", jingle.initiator)
-      .attr("responder", jingle.responder)
-      .attr("sid", jingle.sid)
+      .attr(::minidom::rxml::xml_ncname!("action").to_owned(), jingle.action)
+      .attr(::minidom::rxml::xml_ncname!("initiator").to_owned(), jingle.initiator)
+      .attr(::minidom::rxml::xml_ncname!("responder").to_owned(), jingle.responder)
+      .attr(::minidom::rxml::xml_ncname!("sid").to_owned(), jingle.sid)
       .append_all(jingle.contents)
       .append_all(jingle.reason.map(Element::from))
       .append_all(jingle.group.map(Element::from))

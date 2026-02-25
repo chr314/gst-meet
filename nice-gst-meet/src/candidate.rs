@@ -10,7 +10,6 @@ use std::{
 use glib::translate::*;
 use libc::c_char;
 use nice_sys as ffi;
-use nix::sys::socket::{AddressFamily, SockaddrStorage};
 
 #[cfg(any(feature = "v0_1_18", feature = "dox"))]
 #[cfg_attr(feature = "dox", doc(cfg(feature = "v0_1_18")))]
@@ -69,40 +68,66 @@ impl Candidate {
 
   pub fn addr(&self) -> SocketAddr {
     unsafe {
-      match AddressFamily::from_i32(self.inner.addr.s.addr.sa_family as i32).unwrap() {
-        AddressFamily::Inet => SocketAddrV4::new(
-          self.inner.addr.s.ip4.sin_addr.s_addr.into(),
-          self.inner.addr.s.ip4.sin_port,
-        )
-        .into(),
-        AddressFamily::Inet6 => SocketAddrV6::new(
-          self.inner.addr.s.ip6.sin6_addr.s6_addr.into(),
-          self.inner.addr.s.ip6.sin6_port,
-          self.inner.addr.s.ip6.sin6_flowinfo,
-          self.inner.addr.s.ip6.sin6_scope_id,
-        )
-        .into(),
-        other => panic!("unsupported address family: {:?}", other),
+      let family = self.inner.addr.s.addr.sa_family as i32;
+      #[cfg(unix)]
+      {
+        if family == libc::AF_INET {
+          SocketAddrV4::new(
+            self.inner.addr.s.ip4.sin_addr.s_addr.into(),
+            self.inner.addr.s.ip4.sin_port,
+          )
+          .into()
+        }
+        else if family == libc::AF_INET6 {
+          SocketAddrV6::new(
+            self.inner.addr.s.ip6.sin6_addr.s6_addr.into(),
+            self.inner.addr.s.ip6.sin6_port,
+            self.inner.addr.s.ip6.sin6_flowinfo,
+            self.inner.addr.s.ip6.sin6_scope_id,
+          )
+          .into()
+        }
+        else {
+          panic!("unsupported address family: {}", family);
+        }
+      }
+      #[cfg(windows)]
+      {
+        const AF_INET: i32 = 2;
+        const AF_INET6: i32 = 23;
+        if family == AF_INET {
+          SocketAddrV4::new(
+            self.inner.addr.s.ip4.sin_addr.S_un.S_addr.into(),
+            self.inner.addr.s.ip4.sin_port,
+          )
+          .into()
+        }
+        else if family == AF_INET6 {
+          SocketAddrV6::new(
+            self.inner.addr.s.ip6.sin6_addr.u.Byte.into(),
+            self.inner.addr.s.ip6.sin6_port,
+            self.inner.addr.s.ip6.sin6_flowinfo,
+            self.inner.addr.s.ip6.Anonymous.sin6_scope_id,
+          )
+          .into()
+        }
+        else {
+          panic!("unsupported address family: {}", family);
+        }
       }
     }
   }
 
   pub fn set_addr(&mut self, addr: SocketAddr) {
-    let sockaddr = SockaddrStorage::from(addr);
-    if let Some(v4) = sockaddr.as_sockaddr_in() {
-      unsafe {
-        ffi::nice_address_set_ipv4(&mut self.inner.addr as *mut _, v4.ip().into());
+    match addr {
+      SocketAddr::V4(v4) => unsafe {
+        ffi::nice_address_set_ipv4(&mut self.inner.addr as *mut _, u32::from(*v4.ip()));
         ffi::nice_address_set_port(&mut self.inner.addr as *mut _, v4.port() as u32);
-      }
-    }
-    else if let Some(v6) = sockaddr.as_sockaddr_in6() {
-      unsafe {
+      },
+      SocketAddr::V6(v6) => unsafe {
         ffi::nice_address_set_ipv6(&mut self.inner.addr as *mut _, v6.ip().octets().as_ptr());
         ffi::nice_address_set_port(&mut self.inner.addr as *mut _, v6.port() as u32);
-      }
-    }
-    else {
-      panic!("unsupported address family");
+      },
     }
   }
 

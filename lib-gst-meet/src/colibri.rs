@@ -6,7 +6,7 @@ use futures::{
   sink::SinkExt,
   stream::{StreamExt, TryStreamExt},
 };
-use rand::{thread_rng, RngCore};
+use rand::Rng;
 use tokio::{
   sync::{mpsc, Mutex},
   time::sleep,
@@ -37,7 +37,7 @@ impl ColibriChannel {
     let mut retries = 0;
     let colibri_websocket = loop {
       let mut key = [0u8; 16];
-      thread_rng().fill_bytes(&mut key);
+      rand::rng().fill_bytes(&mut key);
       let request = Request::get(&uri)
         .header("sec-websocket-key", base64::encode(&key))
         .header("sec-websocket-version", "13")

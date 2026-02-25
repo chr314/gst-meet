@@ -8,7 +8,7 @@
 
 macro_rules! get_attr {
   ($elem:ident, $attr:tt, $type:tt) => {
-    get_attr!($elem, $attr, $type, value, value.parse()?)
+    get_attr!($elem, $attr, $type, value, value.parse().map_err(xmpp_parsers::Error::text_parse_error)?)
   };
   ($elem:ident, $attr:tt, OptionEmpty, $value:ident, $func:expr) => {
     match $elem.attr($attr) {
@@ -27,7 +27,7 @@ macro_rules! get_attr {
     match $elem.attr($attr) {
       Some($value) => $func,
       None => {
-        return Err(xmpp_parsers::Error::ParseError(concat!(
+        return Err(xmpp_parsers::Error::Other(concat!(
           "Required attribute '",
           $attr,
           "' missing."
@@ -38,7 +38,7 @@ macro_rules! get_attr {
   ($elem:ident, $attr:tt, RequiredNonEmpty, $value:ident, $func:expr) => {
     match $elem.attr($attr) {
       Some("") => {
-        return Err(xmpp_parsers::Error::ParseError(concat!(
+        return Err(xmpp_parsers::Error::Other(concat!(
           "Required attribute '",
           $attr,
           "' must not be empty."
@@ -46,7 +46,7 @@ macro_rules! get_attr {
       },
       Some($value) => $func,
       None => {
-        return Err(xmpp_parsers::Error::ParseError(concat!(
+        return Err(xmpp_parsers::Error::Other(concat!(
           "Required attribute '",
           $attr,
           "' missing."
@@ -83,7 +83,7 @@ macro_rules! generate_attribute {
           fn from_str(s: &str) -> Result<$elem, xmpp_parsers::Error> {
               Ok(match s {
                   $($b => $elem::$a),+,
-                  _ => return Err(xmpp_parsers::Error::ParseError(concat!("Unknown value for '", $name, "' attribute."))),
+                  _ => return Err(xmpp_parsers::Error::Other(concat!("Unknown value for '", $name, "' attribute."))),
               })
           }
       }
@@ -116,7 +116,7 @@ macro_rules! generate_attribute {
           fn from_str(s: &str) -> Result<$elem, xmpp_parsers::Error> {
               Ok(match s {
                   $($b => $elem::$a),+,
-                  _ => return Err(xmpp_parsers::Error::ParseError(concat!("Unknown value for '", $name, "' attribute."))),
+                  _ => return Err(xmpp_parsers::Error::Other(concat!("Unknown value for '", $name, "' attribute."))),
               })
           }
       }
@@ -149,7 +149,7 @@ macro_rules! generate_attribute {
           fn from_str(s: &str) -> Result<Self, xmpp_parsers::Error> {
               Ok(match s {
                   $value => $elem::$symbol,
-                  _ => return Err(xmpp_parsers::Error::ParseError(concat!("Unknown value for '", $name, "' attribute."))),
+                  _ => return Err(xmpp_parsers::Error::Other(concat!("Unknown value for '", $name, "' attribute."))),
               })
           }
       }
@@ -182,7 +182,7 @@ macro_rules! generate_attribute {
               Ok(match s {
                   "true" | "1" => $elem::True,
                   "false" | "0" => $elem::False,
-                  _ => return Err(xmpp_parsers::Error::ParseError(concat!("Unknown value for '", $name, "' attribute."))),
+                  _ => return Err(xmpp_parsers::Error::Other(concat!("Unknown value for '", $name, "' attribute."))),
               })
           }
       }
@@ -239,19 +239,19 @@ macro_rules! generate_element_enum {
               $enum
           ),+
       }
-      impl ::std::convert::TryFrom<xmpp_parsers::Element> for $elem {
+      impl ::std::convert::TryFrom<minidom::Element> for $elem {
           type Error = xmpp_parsers::Error;
-          fn try_from(elem: xmpp_parsers::Element) -> Result<$elem, xmpp_parsers::Error> {
+          fn try_from(elem: minidom::Element) -> Result<$elem, xmpp_parsers::Error> {
               check_ns_only!(elem, $name, $ns);
               Ok(match elem.name() {
                   $($enum_name => $elem::$enum,)+
-                  _ => return Err(xmpp_parsers::Error::ParseError(concat!("This is not a ", $name, " element."))),
+                  _ => return Err(xmpp_parsers::Error::Other(concat!("This is not a ", $name, " element."))),
               })
           }
       }
-      impl From<$elem> for xmpp_parsers::Element {
-          fn from(elem: $elem) -> xmpp_parsers::Element {
-              xmpp_parsers::Element::builder(
+      impl From<$elem> for minidom::Element {
+          fn from(elem: $elem) -> minidom::Element {
+              minidom::Element::builder(
                   match elem {
                       $($elem::$enum => $enum_name,)+
                   },
@@ -276,20 +276,20 @@ macro_rules! generate_attribute_enum {
               $enum
           ),+
       }
-      impl ::std::convert::TryFrom<xmpp_parsers::Element> for $elem {
+      impl ::std::convert::TryFrom<minidom::Element> for $elem {
           type Error = xmpp_parsers::Error;
-          fn try_from(elem: xmpp_parsers::Element) -> Result<$elem, xmpp_parsers::Error> {
+          fn try_from(elem: minidom::Element) -> Result<$elem, xmpp_parsers::Error> {
               check_ns_only!(elem, $name, $ns);
               Ok(match get_attr!(elem, $attr, Required) {
                   $($enum_name => $elem::$enum,)+
-                  _ => return Err(xmpp_parsers::Error::ParseError(concat!("Invalid ", $name, " ", $attr, " value."))),
+                  _ => return Err(xmpp_parsers::Error::Other(concat!("Invalid ", $name, " ", $attr, " value."))),
               })
           }
       }
-      impl From<$elem> for xmpp_parsers::Element {
-          fn from(elem: $elem) -> xmpp_parsers::Element {
-              xmpp_parsers::Element::builder($name, $ns)
-                  .attr($attr, match elem {
+      impl From<$elem> for minidom::Element {
+          fn from(elem: $elem) -> minidom::Element {
+              minidom::Element::builder($name, $ns)
+                  .attr(::minidom::rxml::xml_ncname!($attr).to_owned(), match elem {
                        $($elem::$enum => $enum_name,)+
                    })
                    .build()
@@ -304,7 +304,7 @@ macro_rules! check_self {
   };
   ($elem:ident, $name:tt, $ns:ident, $pretty_name:tt) => {
     if !$elem.is($name, $ns) {
-      return Err(xmpp_parsers::Error::ParseError(concat!(
+      return Err(xmpp_parsers::Error::Other(concat!(
         "This is not a ",
         $pretty_name,
         " element."
@@ -316,7 +316,7 @@ macro_rules! check_self {
 macro_rules! check_ns_only {
   ($elem:ident, $name:tt, $ns:ident) => {
     if !$elem.has_ns($ns) {
-      return Err(xmpp_parsers::Error::ParseError(concat!(
+      return Err(xmpp_parsers::Error::Other(concat!(
         "This is not a ",
         $name,
         " element."
@@ -331,18 +331,18 @@ macro_rules! generate_empty_element {
       #[derive(Debug, Clone, PartialEq)]
       pub struct $elem;
 
-      impl ::std::convert::TryFrom<xmpp_parsers::Element> for $elem {
+      impl ::std::convert::TryFrom<minidom::Element> for $elem {
           type Error = xmpp_parsers::Error;
 
-          fn try_from(elem: xmpp_parsers::Element) -> Result<$elem, xmpp_parsers::Error> {
+          fn try_from(elem: minidom::Element) -> Result<$elem, xmpp_parsers::Error> {
               check_self!(elem, $name, $ns);
               Ok($elem)
           }
       }
 
-      impl From<$elem> for xmpp_parsers::Element {
-          fn from(_: $elem) -> xmpp_parsers::Element {
-              xmpp_parsers::Element::builder($name, $ns)
+      impl From<$elem> for minidom::Element {
+          fn from(_: $elem) -> minidom::Element {
+              minidom::Element::builder($name, $ns)
                   .build()
           }
       }
@@ -384,17 +384,17 @@ macro_rules! generate_elem_id {
       $(#[$meta])*
       #[derive(Debug, Clone, PartialEq, Eq, Hash)]
       pub struct $elem(pub $type);
-      impl ::std::convert::TryFrom<xmpp_parsers::Element> for $elem {
+      impl ::std::convert::TryFrom<minidom::Element> for $elem {
           type Error = xmpp_parsers::Error;
-          fn try_from(elem: xmpp_parsers::Element) -> Result<$elem, xmpp_parsers::Error> {
+          fn try_from(elem: minidom::Element) -> Result<$elem, xmpp_parsers::Error> {
               check_self!(elem, $name, $ns);
               // TODO: add a way to parse that differently when needed.
               Ok($elem(elem.text().parse()?))
           }
       }
-      impl From<$elem> for xmpp_parsers::Element {
-          fn from(elem: $elem) -> xmpp_parsers::Element {
-              xmpp_parsers::Element::builder($name, $ns)
+      impl From<$elem> for minidom::Element {
+          fn from(elem: $elem) -> minidom::Element {
+              minidom::Element::builder($name, $ns)
                   .append(elem.0.to_string())
                   .build()
           }
@@ -468,7 +468,7 @@ macro_rules! do_parse_elem {
   };
   ($temp:ident: Option = $constructor:ident => $elem:ident, $name:tt, $parent_name:tt) => {
     if $temp.is_some() {
-      return Err(xmpp_parsers::Error::ParseError(concat!(
+      return Err(xmpp_parsers::Error::Other(concat!(
         "Element ",
         $parent_name,
         " must not have more than one ",
@@ -480,7 +480,7 @@ macro_rules! do_parse_elem {
   };
   ($temp:ident: Required = $constructor:ident => $elem:ident, $name:tt, $parent_name:tt) => {
     if $temp.is_some() {
-      return Err(xmpp_parsers::Error::ParseError(concat!(
+      return Err(xmpp_parsers::Error::Other(concat!(
         "Element ",
         $parent_name,
         " must not have more than one ",
@@ -492,7 +492,7 @@ macro_rules! do_parse_elem {
   };
   ($temp:ident: Present = $constructor:ident => $elem:ident, $name:tt, $parent_name:tt) => {
     if $temp {
-      return Err(xmpp_parsers::Error::ParseError(concat!(
+      return Err(xmpp_parsers::Error::Other(concat!(
         "Element ",
         $parent_name,
         " must not have more than one ",
@@ -512,7 +512,7 @@ macro_rules! finish_parse_elem {
     $temp
   };
   ($temp:ident: Required = $name:tt, $parent_name:tt) => {
-    $temp.ok_or(xmpp_parsers::Error::ParseError(concat!(
+    $temp.ok_or(xmpp_parsers::Error::Other(concat!(
       "Missing child ",
       $name,
       " in ",
@@ -528,28 +528,28 @@ macro_rules! finish_parse_elem {
 macro_rules! generate_serialiser {
   ($builder:ident, $parent:ident, $elem:ident, Required, String, ($name:tt, $ns:ident)) => {
     $builder.append(
-      xmpp_parsers::Element::builder($name, $ns).append(::minidom::Node::Text($parent.$elem)),
+      minidom::Element::builder($name, $ns).append(::minidom::Node::Text($parent.$elem)),
     )
   };
   ($builder:ident, $parent:ident, $elem:ident, Option, String, ($name:tt, $ns:ident)) => {
     $builder.append_all(
       $parent
         .$elem
-        .map(|elem| xmpp_parsers::Element::builder($name, $ns).append(::minidom::Node::Text(elem))),
+        .map(|elem| minidom::Element::builder($name, $ns).append(::minidom::Node::Text(elem))),
     )
   };
   ($builder:ident, $parent:ident, $elem:ident, Option, $constructor:ident, ($name:tt, *)) => {
     $builder.append_all(
       $parent
         .$elem
-        .map(|elem| ::minidom::Node::Element(xmpp_parsers::Element::from(elem))),
+        .map(|elem| ::minidom::Node::Element(minidom::Element::from(elem))),
     )
   };
   ($builder:ident, $parent:ident, $elem:ident, Option, $constructor:ident, ($name:tt, $ns:ident)) => {
     $builder.append_all(
       $parent
         .$elem
-        .map(|elem| ::minidom::Node::Element(xmpp_parsers::Element::from(elem))),
+        .map(|elem| ::minidom::Node::Element(minidom::Element::from(elem))),
     )
   };
   ($builder:ident, $parent:ident, $elem:ident, Vec, $constructor:ident, ($name:tt, $ns:ident)) => {
@@ -557,11 +557,11 @@ macro_rules! generate_serialiser {
   };
   ($builder:ident, $parent:ident, $elem:ident, Present, $constructor:ident, ($name:tt, $ns:ident)) => {
     $builder.append(::minidom::Node::Element(
-      xmpp_parsers::Element::builder($name, $ns).build(),
+      minidom::Element::builder($name, $ns).build(),
     ))
   };
   ($builder:ident, $parent:ident, $elem:ident, $_:ident, $constructor:ident, ($name:tt, $ns:ident)) => {
-    $builder.append(::minidom::Node::Element(xmpp_parsers::Element::from(
+    $builder.append(::minidom::Node::Element(minidom::Element::from(
       $parent.$elem,
     )))
   };
@@ -613,10 +613,10 @@ macro_rules! generate_element {
           )*
       }
 
-      impl ::std::convert::TryFrom<xmpp_parsers::Element> for $elem {
+      impl ::std::convert::TryFrom<minidom::Element> for $elem {
           type Error = xmpp_parsers::Error;
 
-          fn try_from(elem: xmpp_parsers::Element) -> Result<$elem, xmpp_parsers::Error> {
+          fn try_from(elem: minidom::Element) -> Result<$elem, xmpp_parsers::Error> {
               check_self!(elem, $name, $ns);
               $(
                   start_parse_elem!($child_ident: $coucou);
@@ -643,11 +643,11 @@ macro_rules! generate_element {
           }
       }
 
-      impl From<$elem> for xmpp_parsers::Element {
-          fn from(elem: $elem) -> xmpp_parsers::Element {
-              let mut builder = xmpp_parsers::Element::builder($name, $ns);
+      impl From<$elem> for minidom::Element {
+          fn from(elem: $elem) -> minidom::Element {
+              let mut builder = minidom::Element::builder($name, $ns);
               $(
-                  builder = builder.attr($attr_name, elem.$attr);
+                  builder = builder.attr(::minidom::rxml::xml_ncname!($attr_name).to_owned(), elem.$attr);
               )*
               $(
                   builder = generate_serialiser!(builder, elem, $child_ident, $coucou, $child_constructor, ($child_name, $child_ns));
@@ -672,15 +672,15 @@ macro_rules! assert_size (
 // TODO: move that to src/pubsub/mod.rs, once we figure out how to use macros from there.
 macro_rules! impl_pubsub_item {
   ($item:ident, $ns:ident) => {
-    impl ::std::convert::TryFrom<xmpp_parsers::Element> for $item {
+    impl ::std::convert::TryFrom<minidom::Element> for $item {
       type Error = Error;
 
-      fn try_from(elem: xmpp_parsers::Element) -> Result<$item, Error> {
+      fn try_from(elem: minidom::Element) -> Result<$item, Error> {
         check_self!(elem, "item", $ns);
         let mut payloads = elem.children().cloned().collect::<Vec<_>>();
         let payload = payloads.pop();
         if !payloads.is_empty() {
-          return Err(Error::ParseError(
+          return Err(Error::Other(
             "More than a single payload in item element.",
           ));
         }
@@ -692,11 +692,11 @@ macro_rules! impl_pubsub_item {
       }
     }
 
-    impl From<$item> for xmpp_parsers::Element {
-      fn from(item: $item) -> xmpp_parsers::Element {
-        xmpp_parsers::Element::builder("item", $ns)
-          .attr("id", item.0.id)
-          .attr("publisher", item.0.publisher)
+    impl From<$item> for minidom::Element {
+      fn from(item: $item) -> minidom::Element {
+        minidom::Element::builder("item", $ns)
+          .attr(::minidom::rxml::xml_ncname!("id").to_owned(), item.0.id)
+          .attr(::minidom::rxml::xml_ncname!("publisher").to_owned(), item.0.publisher)
           .append_all(item.0.payload)
           .build()
       }

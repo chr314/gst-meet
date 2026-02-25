@@ -40,7 +40,7 @@ impl Fingerprint {
     hash: &str,
   ) -> Result<Fingerprint, Error> {
     let algo = algo.parse()?;
-    let hash = Hash::from_colon_separated_hex(algo, hash)?;
+    let hash = Hash::from_colon_separated_hex(algo, hash).map_err(xmpp_parsers::Error::text_parse_error)?;
     Ok(Fingerprint::from_hash(setup, hash))
   }
 }

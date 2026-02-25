@@ -347,7 +347,9 @@ async fn main_inner() -> Result<()> {
       selected_endpoints: opt
         .select_endpoints
         .map(|endpoints| endpoints.split(',').map(ToOwned::to_owned).collect()),
+      selected_sources: None,
       on_stage_endpoints: None,
+      on_stage_sources: None,
       default_constraints: Some(Constraints {
         max_height: Some(opt.recv_video_scale_height.into()),
         ideal_height: None,
@@ -437,10 +439,11 @@ async fn main_inner() -> Result<()> {
               participant
                 .jid
                 .as_ref()
-                .and_then(|jid| jid.node_str())
+                .and_then(|jid| jid.node())
+                .map(|n| n.as_str())
                 .unwrap_or_default(),
             )
-            .replace("{participant_id}", &participant.muc_jid.resource_str())
+            .replace("{participant_id}", participant.muc_jid.resource().as_str())
             .replace("{nick}", &participant.nick.unwrap_or_default());
 
           let bin = gstreamer::parse::bin_from_description(&pipeline_description, false)

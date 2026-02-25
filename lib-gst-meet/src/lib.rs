@@ -2,6 +2,7 @@ pub mod colibri;
 mod conference;
 mod jingle;
 mod pinger;
+mod pipeline;
 mod source;
 mod stanza_filter;
 mod tls;

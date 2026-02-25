@@ -5,7 +5,7 @@ use futures::{
   sink::{Sink, SinkExt},
   stream::{Stream, StreamExt, TryStreamExt},
 };
-use rand::{thread_rng, RngCore};
+use rand::Rng;
 use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_tungstenite::tungstenite::{
@@ -13,13 +13,14 @@ use tokio_tungstenite::tungstenite::{
   Message,
 };
 use tracing::{debug, error, info, warn};
+use jid::{BareJid, FullJid, Jid};
+use minidom::Element;
 use xmpp_parsers::{
   bind::{BindQuery, BindResponse},
   disco::{DiscoInfoQuery, DiscoInfoResult},
-  iq::{Iq, IqType},
+  iq::{Iq, IqPayload},
   sasl::{Auth, Mechanism, Success},
   websocket::Open,
-  BareJid, Element, FullJid, Jid,
 };
 
 use crate::{
@@ -93,7 +94,7 @@ impl Connection {
 
     info!("Connecting XMPP WebSocket to {}", websocket_url);
     let mut key = [0u8; 16];
-    thread_rng().fill_bytes(&mut key);
+    rand::rng().fill_bytes(&mut key);
     let request = Request::get(&websocket_url)
       .header("sec-websocket-protocol", "xmpp")
       .header("sec-websocket-key", base64::encode(&key))
@@ -298,9 +299,10 @@ impl Connection {
         },
         Binding => match Iq::try_from(element) {
           Ok(iq) => {
-            let jid = if let IqType::Result(Some(element)) = iq.payload {
+            let (_, payload) = iq.split();
+            let jid = if let IqPayload::Result(Some(element)) = payload {
               let bind = BindResponse::try_from(element)?;
-              FullJid::try_from(bind)?
+              FullJid::from(bind)
             }
             else {
               bail!("bind failed");
@@ -313,8 +315,8 @@ impl Connection {
               .push(Box::new(Pinger::new(jid.clone(), tx.clone())));
 
             let iq = Iq::from_get(generate_id(), DiscoInfoQuery { node: None })
-              .with_from(Jid::Full(jid.clone()))
-              .with_to(Jid::Bare(locked_inner.xmpp_domain.clone()));
+              .with_from(jid.clone().into())
+              .with_to(locked_inner.xmpp_domain.clone().into());
             tx.send(iq.into()).await?;
             locked_inner.state = Discovering;
           },
@@ -324,8 +326,8 @@ impl Connection {
           ),
         },
         Discovering => {
-          let iq = Iq::try_from(element)?;
-          if let IqType::Result(Some(element)) = iq.payload {
+          let (_, payload) = Iq::try_from(element)?.split();
+          if let IqPayload::Result(Some(element)) = payload {
             let _disco_info = DiscoInfoResult::try_from(element)?;
           }
           else {
@@ -333,16 +335,14 @@ impl Connection {
           }
 
           let iq = Iq::from_get(generate_id(), xmpp::extdisco::ServicesQuery {})
-            .with_from(Jid::Full(
-              locked_inner.jid.as_ref().context("missing jid")?.clone(),
-            ))
-            .with_to(Jid::Bare(locked_inner.xmpp_domain.clone()));
+            .with_from(locked_inner.jid.as_ref().context("missing jid")?.clone().into())
+            .with_to(locked_inner.xmpp_domain.clone().into());
           tx.send(iq.into()).await?;
           locked_inner.state = DiscoveringExternalServices;
         },
         DiscoveringExternalServices => {
-          let iq = Iq::try_from(element)?;
-          if let IqType::Result(Some(element)) = iq.payload {
+          let (_, payload) = Iq::try_from(element)?.split();
+          if let IqPayload::Result(Some(element)) = payload {
             let services = xmpp::extdisco::ServicesResult::try_from(element)?;
             debug!("external services: {:?}", services.services);
             locked_inner.external_services = services.services;

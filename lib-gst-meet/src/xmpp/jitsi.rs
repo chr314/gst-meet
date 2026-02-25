@@ -1,7 +1,8 @@
 use std::{collections::HashMap, convert::TryFrom};
 
 use anyhow::Result;
-use xmpp_parsers::{iq::IqSetPayload, Element};
+use minidom::Element;
+use xmpp_parsers::iq::IqSetPayload;
 
 use crate::xmpp::ns;
 
@@ -24,13 +25,13 @@ impl TryFrom<Element> for Conference {
 impl From<Conference> for Element {
   fn from(conference: Conference) -> Element {
     let mut builder = Element::builder("conference", ns::JITSI_FOCUS)
-      .attr("machine-uid", conference.machine_uid)
-      .attr("room", conference.room);
+      .attr(::minidom::rxml::xml_ncname!("machine-uid").to_owned(), conference.machine_uid)
+      .attr(::minidom::rxml::xml_ncname!("room").to_owned(), conference.room);
     for (name, value) in conference.properties {
       builder = builder.append(
         Element::builder("property", ns::JITSI_FOCUS)
-          .attr("name", name)
-          .attr("value", value)
+          .attr(::minidom::rxml::xml_ncname!("name").to_owned(), name)
+          .attr(::minidom::rxml::xml_ncname!("value").to_owned(), value)
           .build(),
       );
     }

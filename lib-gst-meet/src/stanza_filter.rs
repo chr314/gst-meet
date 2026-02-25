@@ -1,6 +1,6 @@
 use anyhow::Result;
 use async_trait::async_trait;
-use xmpp_parsers::Element;
+use minidom::Element;
 
 #[async_trait]
 pub trait StanzaFilter {

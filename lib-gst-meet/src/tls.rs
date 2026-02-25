@@ -12,9 +12,8 @@ use tokio_tungstenite::Connector;
 #[cfg(feature = "tls-rustls-native-roots")]
 pub(crate) fn wss_connector(insecure: bool) -> Result<tokio_tungstenite::Connector> {
   let mut roots = rustls::RootCertStore::empty();
-  for cert in
-    rustls_native_certs::load_native_certs().context("failed to load native root certs")?
-  {
+  let native_certs = rustls_native_certs::load_native_certs();
+  for cert in native_certs.certs {
     roots.add(cert).context("failed to add native root certs")?;
   }
 
