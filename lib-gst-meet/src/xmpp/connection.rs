@@ -191,11 +191,18 @@ impl Connection {
       {
         let ps = syntect::parsing::SyntaxSet::load_defaults_newlines();
         let ts = syntect::highlighting::ThemeSet::load_defaults();
-        let syntax = ps.find_syntax_by_extension("xml").unwrap();
-        let mut h = syntect::easy::HighlightLines::new(syntax, &ts.themes["Solarized (dark)"]);
-        let ranges: Vec<_> = h.highlight_line(&xml, &ps).unwrap();
-        let escaped = syntect::util::as_24_bit_terminal_escaped(&ranges[..], false);
-        debug!("XMPP    \x1b[32;1m>>> {}\x1b[0m", escaped);
+        let mut highlighted = false;
+        if let Some(syntax) = ps.find_syntax_by_extension("xml") {
+          let mut h = syntect::easy::HighlightLines::new(syntax, &ts.themes["Solarized (dark)"]);
+          if let Ok(ranges) = h.highlight_line(&xml, &ps) {
+            let escaped = syntect::util::as_24_bit_terminal_escaped(&ranges[..], false);
+            debug!("XMPP    \x1b[32;1m>>> {}\x1b[0m", escaped);
+            highlighted = true;
+          }
+        }
+        if !highlighted {
+          debug!("XMPP    >>> {}", xml);
+        }
       }
       #[cfg(not(feature = "syntax-highlighting"))]
       debug!("XMPP    >>> {}", xml);
@@ -223,11 +230,18 @@ impl Connection {
           {
             let ps = syntect::parsing::SyntaxSet::load_defaults_newlines();
             let ts = syntect::highlighting::ThemeSet::load_defaults();
-            let syntax = ps.find_syntax_by_extension("xml").unwrap();
-            let mut h = syntect::easy::HighlightLines::new(syntax, &ts.themes["Solarized (dark)"]);
-            let ranges: Vec<_> = h.highlight_line(&xml, &ps).unwrap();
-            let escaped = syntect::util::as_24_bit_terminal_escaped(&ranges[..], false);
-            debug!("XMPP    \x1b[31;1m<<< {}\x1b[0m", escaped);
+            let mut highlighted = false;
+            if let Some(syntax) = ps.find_syntax_by_extension("xml") {
+              let mut h = syntect::easy::HighlightLines::new(syntax, &ts.themes["Solarized (dark)"]);
+              if let Ok(ranges) = h.highlight_line(&xml, &ps) {
+                let escaped = syntect::util::as_24_bit_terminal_escaped(&ranges[..], false);
+                debug!("XMPP    \x1b[31;1m<<< {}\x1b[0m", escaped);
+                highlighted = true;
+              }
+            }
+            if !highlighted {
+              debug!("XMPP    <<< {}", xml);
+            }
           }
           #[cfg(not(feature = "syntax-highlighting"))]
           debug!("XMPP    <<< {}", xml);

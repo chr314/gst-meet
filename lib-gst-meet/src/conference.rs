@@ -587,43 +587,45 @@ impl StanzaFilter for JitsiConference {
           match payload {
             IqPayload::Get(element) => {
               if let Ok(query) = DiscoInfoQuery::try_from(element) {
-                debug!(
-                  "Received disco info query from {} for node {:?}",
-                  header.from.as_ref().unwrap(),
-                  query.node
-                );
-                if let Some(node) = query.node {
-                  match node.splitn(2, '#').collect::<Vec<_>>().as_slice() {
-                    // TODO: also support ecaps2, as we send it in our presence.
-                    [uri, hash]
-                      if *uri == DISCO_NODE && *hash == COMPUTED_CAPS_HASH.to_base64() =>
-                    {
-                      let mut disco_info = DISCO_INFO.clone();
-                      disco_info.node = Some(node);
-                      let iq = Iq::from_result(header.id, Some(disco_info))
-                        .with_from(self.jid.clone().into())
-                        .with_to(header.from.unwrap());
-                      self.xmpp_tx.send(iq.into()).await?;
-                    },
-                    _ => {
-                      let error = StanzaError::new(
-                        ErrorType::Cancel,
-                        DefinedCondition::ItemNotFound,
-                        "en",
-                        format!("Unknown disco#info node: {}", node),
-                      );
-                      let iq = Iq::from_error(header.id, error)
-                        .with_from(self.jid.clone().into())
-                        .with_to(header.from.unwrap());
-                      self.xmpp_tx.send(iq.into()).await?;
-                    },
+                if let Some(from) = header.from {
+                  debug!(
+                    "Received disco info query from {} for node {:?}",
+                    from,
+                    query.node
+                  );
+                  if let Some(node) = query.node {
+                    match node.splitn(2, '#').collect::<Vec<_>>().as_slice() {
+                      // TODO: also support ecaps2, as we send it in our presence.
+                      [uri, hash]
+                        if *uri == DISCO_NODE && *hash == COMPUTED_CAPS_HASH.to_base64() =>
+                      {
+                        let mut disco_info = DISCO_INFO.clone();
+                        disco_info.node = Some(node);
+                        let iq = Iq::from_result(header.id, Some(disco_info))
+                          .with_from(self.jid.clone().into())
+                          .with_to(from);
+                        self.xmpp_tx.send(iq.into()).await?;
+                      },
+                      _ => {
+                        let error = StanzaError::new(
+                          ErrorType::Cancel,
+                          DefinedCondition::ItemNotFound,
+                          "en",
+                          format!("Unknown disco#info node: {}", node),
+                        );
+                        let iq = Iq::from_error(header.id, error)
+                          .with_from(self.jid.clone().into())
+                          .with_to(from);
+                        self.xmpp_tx.send(iq.into()).await?;
+                      },
+                    }
                   }
-                }
-                else {
-                  let iq = Iq::from_result(header.id, Some(DISCO_INFO.clone()))
-                    .with_from(self.jid.clone().into())
-                    .with_to(header.from.unwrap());
-                  self.xmpp_tx.send(iq.into()).await?;
+                  else {
+                    let iq = Iq::from_result(header.id, Some(DISCO_INFO.clone()))
+                      .with_from(self.jid.clone().into())
+                      .with_to(from);
+                    self.xmpp_tx.send(iq.into()).await?;
+                  }
                 }
               }
             },
@@ -915,18 +917,20 @@ impl StanzaFilter for JitsiConference {
                             } if to == &my_endpoint_id => {
                               match serde_json::from_value::<JsonMessage>(msg_payload.clone()) {
                                 Ok(JsonMessage::E2ePingRequest { id }) => {
-                                  if let Err(e) = colibri_channel
-                                    .send(ColibriMessage::EndpointMessage {
-                                      from: None,
-                                      to: from.clone(),
-                                      msg_payload: serde_json::to_value(
-                                        JsonMessage::E2ePingResponse { id },
-                                      )
-                                      .unwrap(),
-                                    })
-                                    .await
-                                  {
-                                    warn!("failed to send e2e ping response: {:?}", e);
+                                  let new_payload = serde_json::to_value(
+                                    JsonMessage::E2ePingResponse { id },
+                                  );
+                                  if let Ok(new_payload) = new_payload {
+                                    if let Err(e) = colibri_channel
+                                        .send(ColibriMessage::EndpointMessage {
+                                          from: None,
+                                          to: from.clone(),
+                                          msg_payload: new_payload,
+                                        })
+                                        .await
+                                    {
+                                      warn!("failed to send e2e ping response: {:?}", e);
+                                    }
                                   }
                                   true
                                 },
@@ -953,7 +957,7 @@ impl StanzaFilter for JitsiConference {
                   }
 
                   if let Some(connected_tx) = self.inner.lock().await.connected_tx.take() {
-                    connected_tx.send(()).unwrap();
+                    let _ = connected_tx.send(());
                   }
                 }
               }

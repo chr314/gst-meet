@@ -13,7 +13,7 @@ impl TryFrom<Element> for ServicesQuery {
   type Error = anyhow::Error;
 
   fn try_from(_elem: Element) -> Result<ServicesQuery> {
-    unimplemented!()
+    anyhow::bail!("ServicesQuery deserialization is not supported")
   }
 }
 

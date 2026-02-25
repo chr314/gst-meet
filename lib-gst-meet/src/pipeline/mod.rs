@@ -80,7 +80,7 @@ impl MediaPipeline {
         if pad_name.starts_with("recv_rtp_src_0_") {
           if let Some(peer_pad) = pad.peer() {
             if let Some(element) = peer_pad.parent_element() {
-              element.set_state(gstreamer::State::Paused).unwrap();
+              element.set_state(gstreamer::State::Paused);
             }
           }
         }
@@ -347,7 +347,7 @@ impl MediaPipeline {
             if state.current() == gstreamer::State::Null =>
           {
             debug!("pipeline state is null");
-            pipeline_state_null_tx.send(()).unwrap();
+            pipeline_state_null_tx.send(());
             break;
           },
           _ => {},

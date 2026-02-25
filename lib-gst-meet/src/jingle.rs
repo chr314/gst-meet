@@ -296,7 +296,9 @@ impl JingleSession {
       transport.pwd = Some(ice_local_pwd.clone());
       transport.candidates = vec![];
       for c in &local_candidates {
-        let addr = c.addr();
+        let Some(addr) = c.addr() else {
+          continue;
+        };
         let foundation = c.foundation()?;
         transport
           .candidates

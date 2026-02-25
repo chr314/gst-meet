@@ -66,29 +66,33 @@ impl Candidate {
     self.inner.transport = transport.into_glib();
   }
 
-  pub fn addr(&self) -> SocketAddr {
+  pub fn addr(&self) -> Option<SocketAddr> {
     unsafe {
       let family = self.inner.addr.s.addr.sa_family as i32;
       #[cfg(unix)]
       {
         if family == libc::AF_INET {
-          SocketAddrV4::new(
-            self.inner.addr.s.ip4.sin_addr.s_addr.into(),
-            self.inner.addr.s.ip4.sin_port,
+          Some(
+            SocketAddrV4::new(
+              self.inner.addr.s.ip4.sin_addr.s_addr.into(),
+              self.inner.addr.s.ip4.sin_port,
+            )
+            .into(),
           )
-          .into()
         }
         else if family == libc::AF_INET6 {
-          SocketAddrV6::new(
-            self.inner.addr.s.ip6.sin6_addr.s6_addr.into(),
-            self.inner.addr.s.ip6.sin6_port,
-            self.inner.addr.s.ip6.sin6_flowinfo,
-            self.inner.addr.s.ip6.sin6_scope_id,
+          Some(
+            SocketAddrV6::new(
+              self.inner.addr.s.ip6.sin6_addr.s6_addr.into(),
+              self.inner.addr.s.ip6.sin6_port,
+              self.inner.addr.s.ip6.sin6_flowinfo,
+              self.inner.addr.s.ip6.sin6_scope_id,
+            )
+            .into(),
           )
-          .into()
         }
         else {
-          panic!("unsupported address family: {}", family);
+          None
         }
       }
       #[cfg(windows)]
@@ -96,23 +100,27 @@ impl Candidate {
         const AF_INET: i32 = 2;
         const AF_INET6: i32 = 23;
         if family == AF_INET {
-          SocketAddrV4::new(
-            self.inner.addr.s.ip4.sin_addr.S_un.S_addr.into(),
-            self.inner.addr.s.ip4.sin_port,
+          Some(
+            SocketAddrV4::new(
+              self.inner.addr.s.ip4.sin_addr.S_un.S_addr.into(),
+              self.inner.addr.s.ip4.sin_port,
+            )
+            .into(),
           )
-          .into()
         }
         else if family == AF_INET6 {
-          SocketAddrV6::new(
-            self.inner.addr.s.ip6.sin6_addr.u.Byte.into(),
-            self.inner.addr.s.ip6.sin6_port,
-            self.inner.addr.s.ip6.sin6_flowinfo,
-            self.inner.addr.s.ip6.Anonymous.sin6_scope_id,
+          Some(
+            SocketAddrV6::new(
+              self.inner.addr.s.ip6.sin6_addr.u.Byte.into(),
+              self.inner.addr.s.ip6.sin6_port,
+              self.inner.addr.s.ip6.sin6_flowinfo,
+              self.inner.addr.s.ip6.Anonymous.sin6_scope_id,
+            )
+            .into(),
           )
-          .into()
         }
         else {
-          panic!("unsupported address family: {}", family);
+          None
         }
       }
     }

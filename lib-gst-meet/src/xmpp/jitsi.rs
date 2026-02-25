@@ -18,7 +18,7 @@ impl TryFrom<Element> for Conference {
   type Error = anyhow::Error;
 
   fn try_from(_element: Element) -> Result<Conference> {
-    unimplemented!()
+    anyhow::bail!("Conference deserialization is not supported")
   }
 }
 

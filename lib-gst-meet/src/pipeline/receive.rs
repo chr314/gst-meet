@@ -110,7 +110,7 @@ pub(super) fn connect_pad_added(
           return Ok(());
         }
 
-        let participant_id = maybe_participant_id.unwrap();
+        let participant_id = maybe_participant_id.context("expected participant_id")?;
 
         // Create a per-SSRC bin for the decode chain
         let decode_bin = Bin::new();
