@@ -1,0 +1,13 @@
+[package]
+name = "colibri"
+version = "0.2.0"
+edition = "2021"
+description = "Rust data structures for Jitsi Meet Colibri messages"
+repository = "https://github.com/avstack/colibri"
+license = "MIT/Apache-2.0"
+authors = ["Jasper Hugo <jasper@avstack.io>"]
+
+[dependencies]
+serde = { version = "1", default-features = false, features = ["derive"] }
+serde_json = { version = "1", default-features = false, features = ["std"] }
+serde_with = { version = "1", default-features = false, features = ["macros"] }

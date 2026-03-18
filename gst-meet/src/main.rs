@@ -318,7 +318,7 @@ async fn main_inner() -> Result<()> {
     focus: focus_jid.parse()?,
     nick,
     region,
-    video_codec,
+    video_codecs: vec![video_codec],
     extra_muc_features: vec![],
     start_bitrate: start_bitrate.unwrap_or(800),
     stereo: stereo.unwrap_or_default(),

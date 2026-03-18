@@ -1,10 +1,14 @@
-use std::{collections::HashMap, fmt, ops::ControlFlow};
+use std::{
+  collections::HashMap,
+  fmt,
+  ops::ControlFlow,
+  sync::{Arc, Mutex, RwLock},
+  time::Duration,
+};
 
 use anyhow::{Context, Result};
-use glib::prelude::ToValue as _;
 use gstreamer::prelude::{
-  ElementExt as _, ElementExtManual as _, GstBinExt as _, GstBinExtManual as _, ObjectExt as _,
-  PadExt as _,
+  ElementExt as _, ElementExtManual as _, GstBinExt as _, GstBinExtManual as _, ObjectExt as _, PadExt as _,
 };
 use jitsi_xmpp_parsers::{
   jingle::{Description, Jingle},
@@ -12,38 +16,36 @@ use jitsi_xmpp_parsers::{
   jingle_rtp::Description as RtpDescription,
 };
 use nice_gst_meet as nice;
-use tokio::{runtime::Handle, sync::oneshot};
-use tracing::{debug, error, warn};
+use tokio::sync::oneshot;
+use tracing::{debug, warn};
 
 use crate::{
   conference::JitsiConference,
   source::{MediaType, Source},
 };
 
+mod build;
 mod codec;
+mod decode;
 mod ice;
-mod receive;
 mod send;
 mod transport;
 
+pub(crate) use build::PipelineBuildConfig;
 pub(crate) use codec::{Codec, CodecName, ParsedRtpDescription};
+use decode::DecodeBinInfo;
 pub(crate) use ice::participant_id_for_owner;
-use codec::{RTP_HDREXT_SSRC_AUDIO_LEVEL, RTP_HDREXT_TRANSPORT_CC};
-use receive::DecodeBinInfo;
 
 pub(crate) struct MediaPipeline {
   pipeline: gstreamer::Pipeline,
   audio_sink_element: gstreamer::Element,
   video_sink_element: gstreamer::Element,
-  pub(crate) remote_ssrc_map: HashMap<u32, Source>,
+  pub(crate) remote_ssrc_map: Arc<RwLock<HashMap<u32, Source>>>,
   ice_agent: nice::Agent,
   ice_stream_id: u32,
   ice_component_id: u32,
   pipeline_state_null_rx: oneshot::Receiver<()>,
-  /// Per-SSRC decode bins for cleanup.
-  decode_bins: HashMap<u32, DecodeBinInfo>,
-  /// Fakesinks added for JVB-owned sources.
-  jvb_fakesinks: Vec<gstreamer::Element>,
+  decode_bins: Arc<Mutex<HashMap<u32, DecodeBinInfo>>>,
 }
 
 impl fmt::Debug for MediaPipeline {
@@ -70,7 +72,9 @@ impl MediaPipeline {
   }
 
   pub(crate) fn ice_local_candidates(&self) -> Vec<nice::Candidate> {
-    self.ice_agent.local_candidates(self.ice_stream_id, self.ice_component_id)
+    self
+      .ice_agent
+      .local_candidates(self.ice_stream_id, self.ice_component_id)
   }
 
   pub(crate) fn pause_all_sinks(&self) {
@@ -90,7 +94,14 @@ impl MediaPipeline {
   }
 
   pub(crate) async fn pipeline_stopped(self) -> Result<()> {
-    Ok(self.pipeline_state_null_rx.await?)
+    match tokio::time::timeout(Duration::from_secs(5), self.pipeline_state_null_rx).await {
+      Ok(Ok(())) => Ok(()),
+      Ok(Err(e)) => Err(e.into()),
+      Err(_) => {
+        warn!("timed out waiting for pipeline to reach Null state");
+        Ok(())
+      },
+    }
   }
 
   pub(crate) fn parse_rtp_description(
@@ -100,308 +111,54 @@ impl MediaPipeline {
     codec::parse_rtp_description(description, remote_ssrc_map)
   }
 
-  /// Creates and configures the `rtpbin` element.
-  fn build_rtpbin() -> Result<gstreamer::Element> {
-    Ok(
-      gstreamer::ElementFactory::make("rtpbin")
-        .name("rtpbin")
-        .property_from_str("rtp-profile", "savpf")
-        .property("autoremove", true)
-        .property("do-lost", true)
-        .property("do-sync-event", true)
-        .build()?,
-    )
-  }
-
-  /// Connects the `request-pt-map` signal handler that maps payload types to GStreamer Caps.
-  fn connect_request_pt_map(
-    rtpbin: &gstreamer::Element,
-    codecs: Vec<Codec>,
-    audio_hdrext_ssrc_audio_level: Option<u16>,
-    audio_hdrext_transport_cc: Option<u16>,
-    video_hdrext_transport_cc: Option<u16>,
-  ) {
-    rtpbin.connect("request-pt-map", false, move |values| {
-      let f = || {
-        debug!("rtpbin request-pt-map {:?}", values);
-        let pt = values[2].get::<u32>()? as u8;
-        let mut caps = gstreamer::Caps::builder("application/x-rtp").field("payload", pt as i32);
-        for codec in codecs.iter() {
-          if codec.is(pt) {
-            if codec.is_audio() {
-              caps = caps
-                .field("media", "audio")
-                .field("encoding-name", "OPUS")
-                .field("clock-rate", 48000);
-              if let Some(hdrext) = audio_hdrext_ssrc_audio_level {
-                caps = caps.field(&format!("extmap-{}", hdrext), RTP_HDREXT_SSRC_AUDIO_LEVEL);
-              }
-              if let Some(hdrext) = audio_hdrext_transport_cc {
-                caps = caps.field(&format!("extmap-{}", hdrext), RTP_HDREXT_TRANSPORT_CC);
-              }
-            }
-            else {
-              caps = caps
-                .field("media", "video")
-                .field("clock-rate", 90000)
-                .field("encoding-name", codec.encoding_name())
-                .field("rtcp-fb-nack-pli", true);
-              if let Some(hdrext) = video_hdrext_transport_cc {
-                caps = caps.field(&format!("extmap-{}", hdrext), RTP_HDREXT_TRANSPORT_CC);
-              }
-            }
-            return Ok::<_, anyhow::Error>(Some(caps.build()));
-          }
-          else if codec.is_rtx(pt) {
-            caps = caps
-              .field("media", "video")
-              .field("clock-rate", 90000)
-              .field("encoding-name", "RTX")
-              .field("apt", codec.pt);
-            return Ok(Some(caps.build()));
-          }
-        }
-
-        warn!("unknown payload type: {}", pt);
-        Ok(None)
-      };
-      match f() {
-        Ok(Some(caps)) => {
-          debug!("mapped pt to caps: {:?}", caps);
-          Some(caps.to_value())
-        },
-        Ok(None) => None,
-        Err(e) => {
-          error!("handling request-pt-map: {:?}", e);
-          None
-        },
-      }
-    });
-  }
-
-  /// Connects the `new-jitterbuffer` signal that enables retransmission and configures latency.
-  fn connect_new_jitterbuffer(rtpbin: &gstreamer::Element, conference: &JitsiConference) {
-    let handle = Handle::current();
-    let jingle_session = conference.jingle_session.clone();
-    let buffer_size = conference.config.buffer_size;
-    rtpbin.connect("new-jitterbuffer", false, move |values| {
-      let handle = handle.clone();
-      let jingle_session = jingle_session.clone();
-      let f = move || {
-        let rtpjitterbuffer: gstreamer::Element = values[1].get()?;
-        let session: u32 = values[2].get()?;
-        let ssrc: u32 = values[3].get()?;
-        debug!(
-          "new jitterbuffer created for session {} ssrc {}",
-          session, ssrc
-        );
-
-        let source = handle.block_on(async move {
-          Ok::<_, anyhow::Error>(
-            jingle_session
-              .lock()
-              .await
-              .as_ref()
-              .context("not connected (no jingle session)")?
-              .media_pipeline
-              .remote_ssrc_map
-              .get(&ssrc)
-              .context(format!("unknown ssrc: {}", ssrc))?
-              .clone(),
-          )
-        })?;
-        debug!("jitterbuffer is for remote source: {:?}", source);
-        if source.media_type == MediaType::Video && source.participant_id.is_some() {
-          debug!("enabling RTX for ssrc {}", ssrc);
-          rtpjitterbuffer.set_property("do-retransmission", true);
-          rtpjitterbuffer.set_property("drop-on-latency", true);
-          rtpjitterbuffer.set_property("latency", buffer_size);
-        }
-        Ok::<_, anyhow::Error>(())
-      };
-      if let Err(e) = f() {
-        warn!("new-jitterbuffer: {:?}", e);
-      }
-      None
-    });
-  }
-
-  /// Connects both `request-aux-sender` and `request-aux-receiver` signal handlers.
-  fn connect_request_aux(
-    rtpbin: &gstreamer::Element,
-    pts: Vec<(String, u32)>,
-    video_ssrc: u32,
-    video_rtx_ssrc: u32,
-  ) {
-    {
-      let pts = pts.clone();
-      rtpbin.connect("request-aux-sender", false, move |values| {
-        let f = || {
-          let session: u32 = values[1].get()?;
-          debug!("creating RTX sender for session {}", session);
-          let mut pt_map = gstreamer::Structure::builder("application/x-rtp-pt-map");
-          let mut ssrc_map = gstreamer::Structure::builder("application/x-rtp-ssrc-map");
-          for (pt, rtx_pt) in pts.iter() {
-            pt_map = pt_map.field(pt, rtx_pt);
-          }
-          ssrc_map = ssrc_map.field(&video_ssrc.to_string(), &(video_rtx_ssrc as u32));
-          let bin = gstreamer::Bin::new();
-          let rtx_sender = gstreamer::ElementFactory::make("rtprtxsend")
-            .property("payload-type-map", pt_map.build())
-            .property("ssrc-map", ssrc_map.build())
-            .build()?;
-          bin.add(&rtx_sender)?;
-          bin.add_pad(
-            &gstreamer::GhostPad::builder_with_target(
-              &rtx_sender
-                .static_pad("src")
-                .context("rtprtxsend has no src pad")?,
-            )?
-            .name(format!("src_{}", session))
-            .build(),
-          )?;
-          bin.add_pad(
-            &gstreamer::GhostPad::builder_with_target(
-              &rtx_sender
-                .static_pad("sink")
-                .context("rtprtxsend has no sink pad")?,
-            )?
-            .name(format!("sink_{}", session))
-            .build(),
-          )?;
-          Ok::<_, anyhow::Error>(Some(bin.to_value()))
-        };
-        match f() {
-          Ok(o) => o,
-          Err(e) => {
-            warn!("request-aux-sender: {:?}", e);
-            None
-          },
-        }
-      });
-    }
-
-    rtpbin.connect("request-aux-receiver", false, move |values| {
-      let f = || {
-        let session: u32 = values[1].get()?;
-        debug!("creating RTX receiver for session {}", session);
-        let mut pt_map = gstreamer::Structure::builder("application/x-rtp-pt-map");
-        for (pt, rtx_pt) in pts.iter() {
-          pt_map = pt_map.field(pt, rtx_pt);
-        }
-        let bin = gstreamer::Bin::new();
-        let rtx_receiver = gstreamer::ElementFactory::make("rtprtxreceive")
-          .property("payload-type-map", pt_map.build())
-          .build()?;
-        bin.add(&rtx_receiver)?;
-        bin.add_pad(
-          &gstreamer::GhostPad::builder_with_target(
-            &rtx_receiver
-              .static_pad("src")
-              .context("rtprtxreceive has no src pad")?,
-          )?
-          .name(format!("src_{}", session))
-          .build(),
-        )?;
-        bin.add_pad(
-          &gstreamer::GhostPad::builder_with_target(
-            &rtx_receiver
-              .static_pad("sink")
-              .context("rtprtxreceive has no sink pad")?,
-          )?
-          .name(format!("sink_{}", session))
-          .build(),
-        )?;
-        Ok::<_, anyhow::Error>(Some(bin.to_value()))
-      };
-      match f() {
-        Ok(o) => o,
-        Err(e) => {
-          warn!("request-aux-receiver: {:?}", e);
-          None
-        },
-      }
-    });
-  }
-
-  /// Spawns the bus-watching task and returns a receiver that fires when the pipeline hits Null.
-  fn setup_bus_monitor(pipeline: &gstreamer::Pipeline) -> Result<oneshot::Receiver<()>> {
-    let bus = pipeline.bus().context("failed to get pipeline bus")?;
-    let (pipeline_state_null_tx, pipeline_state_null_rx) = oneshot::channel();
-    tokio::spawn(async move {
-      use futures::stream::StreamExt as _;
-      let mut stream = bus.stream();
-      while let Some(msg) = stream.next().await {
-        match msg.view() {
-          gstreamer::MessageView::Error(e) => {
-            if let Some(d) = e.debug() {
-              error!("{}", d);
-            }
-          },
-          gstreamer::MessageView::Warning(e) => {
-            if let Some(d) = e.debug() {
-              warn!("{}", d);
-            }
-          },
-          gstreamer::MessageView::StateChanged(state)
-            if state.current() == gstreamer::State::Null =>
-          {
-            debug!("pipeline state is null");
-            pipeline_state_null_tx.send(());
-            break;
-          },
-          _ => {},
-        }
-      }
-    });
-    Ok(pipeline_state_null_rx)
-  }
-
-  #[allow(clippy::too_many_arguments)]
   pub(crate) async fn build(
     conference: &JitsiConference,
     ice_transport: &IceUdpTransport,
-    codecs: Vec<Codec>,
-    audio_hdrext_ssrc_audio_level: Option<u16>,
-    audio_hdrext_transport_cc: Option<u16>,
-    video_hdrext_transport_cc: Option<u16>,
-    remote_ssrc_map: HashMap<u32, Source>,
-    dtls_cert_pem: &str,
-    dtls_private_key_pem: &str,
-    audio_ssrc: u32,
-    video_ssrc: u32,
-    video_rtx_ssrc: u32,
+    config: PipelineBuildConfig,
   ) -> Result<Self> {
     debug!("building gstreamer pipeline");
 
+    let PipelineBuildConfig {
+      codecs,
+      audio_hdrext_ssrc_audio_level,
+      audio_hdrext_transport_cc,
+      video_hdrext_transport_cc,
+      remote_ssrc_map,
+      dtls_cert_pem,
+      dtls_private_key_pem,
+      audio_ssrc,
+      video_ssrc,
+      video_rtx_ssrc,
+    } = config;
+
     let pipeline = gstreamer::Pipeline::new();
 
-    let rtpbin = Self::build_rtpbin()?;
+    let rtpbin = build::build_rtpbin(conference.config.buffer_size)?;
     pipeline.add(&rtpbin)?;
 
-    let (ice_agent, ice_stream_id, ice_component_id) =
-      ice::setup_ice(conference, ice_transport).await?;
+    let (ice_agent, ice_stream_id, ice_component_id) = ice::setup_ice(conference, ice_transport).await?;
 
     let pts: Vec<(String, u32)> = codecs
       .iter()
       .filter(|codec| codec.is_video())
-      .flat_map(|codec| {
-        codec
-          .rtx_pt
-          .map(|rtx_pt| (codec.pt.to_string(), rtx_pt as u32))
-      })
+      .flat_map(|codec| codec.rtx_pt.map(|rtx_pt| (codec.pt.to_string(), rtx_pt as u32)))
       .collect();
 
-    Self::connect_request_pt_map(
+    let remote_ssrc_map = Arc::new(RwLock::new(remote_ssrc_map));
+    let decode_bins = Arc::new(Mutex::new(HashMap::new()));
+
+    build::connect_request_pt_map(
       &rtpbin,
       codecs.clone(),
       audio_hdrext_ssrc_audio_level,
       audio_hdrext_transport_cc,
       video_hdrext_transport_cc,
     );
-    Self::connect_new_jitterbuffer(&rtpbin, conference);
-    Self::connect_request_aux(&rtpbin, pts, video_ssrc, video_rtx_ssrc);
-    receive::connect_pad_added(&rtpbin, &pipeline, conference, codecs.clone());
+    build::connect_new_jitterbuffer(&rtpbin, &remote_ssrc_map, conference.config.buffer_size);
+    build::connect_request_aux(&rtpbin, pts, video_ssrc, video_rtx_ssrc);
+
+    decode::connect_pad_added(&rtpbin, &pipeline, conference, &codecs, &remote_ssrc_map, &decode_bins);
+    decode::connect_pad_removed(&rtpbin, &pipeline, &decode_bins);
 
     let (audio_sink_element, video_sink_element, rtpfunnel) =
       send::build_send_path(&pipeline, &codecs, audio_ssrc, video_ssrc, conference)?;
@@ -413,8 +170,8 @@ impl MediaPipeline {
       &ice_agent,
       ice_stream_id,
       ice_component_id,
-      dtls_cert_pem,
-      dtls_private_key_pem,
+      &dtls_cert_pem,
+      &dtls_private_key_pem,
       conference,
     )?;
     pipeline.add(&transport_bin)?;
@@ -426,7 +183,7 @@ impl MediaPipeline {
     rtpbin.link_pads(Some("send_rtp_src_0"), &transport_bin, Some("rtp_send_sink"))?;
     rtpbin.link_pads(Some("send_rtcp_src_0"), &transport_bin, Some("rtcp_send_sink"))?;
 
-    let pipeline_state_null_rx = Self::setup_bus_monitor(&pipeline)?;
+    let pipeline_state_null_rx = build::setup_bus_monitor(&pipeline)?;
 
     pipeline.debug_to_dot_file(gstreamer::DebugGraphDetails::ALL, "session-initiate");
 
@@ -439,50 +196,56 @@ impl MediaPipeline {
       ice_stream_id,
       ice_component_id,
       pipeline_state_null_rx,
-      decode_bins: HashMap::new(),
-      jvb_fakesinks: Vec::new(),
+      decode_bins,
     })
   }
 
-  pub(crate) async fn source_add(&mut self, jingle: &Jingle) -> Result<()> {
+  pub(crate) async fn source_add(&self, jingle: &Jingle) -> Result<()> {
     for content in &jingle.contents {
       if let Some(Description::Rtp(description)) = &content.description {
         for ssrc in &description.ssrcs {
-          let owner = ssrc
-            .info
-            .as_ref()
-            .context("missing ssrc-info")?
-            .owner
-            .clone();
+          let owner = ssrc.info.as_ref().context("missing ssrc-info")?.owner.clone();
 
           debug!("adding ssrc to remote_ssrc_map: {:?}", ssrc);
-          self.remote_ssrc_map.insert(
-            ssrc.id,
-            Source {
-              ssrc: ssrc.id,
-              participant_id: participant_id_for_owner(owner)?,
-              media_type: if description.media == "audio" {
-                MediaType::Audio
-              }
-              else {
-                MediaType::Video
+          self
+            .remote_ssrc_map
+            .write()
+            .map_err(|e| anyhow::anyhow!("remote_ssrc_map lock poisoned: {}", e))?
+            .insert(
+              ssrc.id,
+              Source {
+                ssrc: ssrc.id,
+                participant_id: participant_id_for_owner(owner)?,
+                media_type: if description.media == "audio" {
+                  MediaType::Audio
+                } else {
+                  MediaType::Video
+                },
               },
-            },
-          );
+            );
         }
       }
     }
     Ok(())
   }
 
-  pub(crate) fn source_remove(&mut self, jingle: &Jingle) -> Result<()> {
+  pub(crate) fn source_remove(&self, jingle: &Jingle) -> Result<()> {
     for content in &jingle.contents {
       if let Some(Description::Rtp(description)) = &content.description {
         for ssrc in &description.ssrcs {
           debug!("removing ssrc from remote_ssrc_map: {:?}", ssrc);
-          self.remote_ssrc_map.remove(&ssrc.id);
-          if let Some(info) = self.decode_bins.remove(&ssrc.id) {
-            receive::teardown_decode_bin(&self.pipeline, info, ssrc.id);
+          self
+            .remote_ssrc_map
+            .write()
+            .map_err(|e| anyhow::anyhow!("remote_ssrc_map lock poisoned: {}", e))?
+            .remove(&ssrc.id);
+          if let Some(info) = self
+            .decode_bins
+            .lock()
+            .map_err(|e| anyhow::anyhow!("decode_bins lock poisoned: {}", e))?
+            .remove(&ssrc.id)
+          {
+            decode::teardown_decode_bin(&self.pipeline, info, ssrc.id);
           }
         }
       }
@@ -490,36 +253,38 @@ impl MediaPipeline {
     Ok(())
   }
 
-  pub(crate) fn remove_participant(&mut self, participant_id: &str) {
-    // Remove all SSRCs for this participant from remote_ssrc_map
-    self
-      .remote_ssrc_map
-      .retain(|_, source| source.participant_id.as_deref() != Some(participant_id));
+  pub(crate) fn remove_participant(&self, participant_id: &str) {
+    match self.remote_ssrc_map.write() {
+      Ok(mut g) => g.retain(|_, source| source.participant_id.as_deref() != Some(participant_id)),
+      Err(e) => {
+        warn!("remote_ssrc_map lock poisoned in remove_participant: {:?}", e);
+        return;
+      },
+    }
 
-    // Tear down all decode bins for this participant
-    let to_remove: Vec<u32> = self
-      .decode_bins
+    let mut decode_bins = match self.decode_bins.lock() {
+      Ok(g) => g,
+      Err(e) => {
+        warn!("decode_bins lock poisoned in remove_participant: {:?}", e);
+        return;
+      },
+    };
+    let to_remove: Vec<u32> = decode_bins
       .iter()
       .filter(|(_, info)| info.participant_id == participant_id)
       .map(|(ssrc, _)| *ssrc)
       .collect();
     for ssrc in to_remove {
-      if let Some(info) = self.decode_bins.remove(&ssrc) {
-        receive::teardown_decode_bin(&self.pipeline, info, ssrc);
+      if let Some(info) = decode_bins.remove(&ssrc) {
+        decode::teardown_decode_bin(&self.pipeline, info, ssrc);
       }
     }
+    drop(decode_bins);
 
-    // Remove participant bin if it exists
-    if let Some(bin) = self
-      .pipeline
-      .by_name(&format!("participant_{}", participant_id))
-    {
+    if let Some(bin) = self.pipeline.by_name(&format!("participant_{}", participant_id)) {
       debug!("removing participant bin for {}", participant_id);
       if let Err(e) = bin.set_state(gstreamer::State::Null) {
-        warn!(
-          "failed to set participant bin state to Null: {:?}",
-          e
-        );
+        warn!("failed to set participant bin state to Null: {:?}", e);
       }
       if let Err(e) = self.pipeline.remove(&bin) {
         warn!("failed to remove participant bin: {:?}", e);

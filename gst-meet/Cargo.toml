@@ -8,7 +8,7 @@ authors = ["Jasper Hugo <jasper@avstack.io>"]
 
 [dependencies]
 anyhow = { version = "1", default-features = false, features = ["std"] }
-colibri = { version = "0.2", default-features = false }
+colibri = { path = "../colibri", default-features = false }
 futures = { version = "0.3", default-features = false }
 glib = { version = "0.22", default-features = false, features = ["log"] }
 gstreamer = { version = "0.25", default-features = false }

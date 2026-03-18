@@ -155,9 +155,9 @@ pub unsafe extern "C" fn gstmeet_connection_join_conference(
     focus,
     nick: CStr::from_ptr((*config).nick).to_string_lossy().to_string(),
     region,
-    video_codec: CStr::from_ptr((*config).video_codec)
+    video_codecs: vec![CStr::from_ptr((*config).video_codec)
       .to_string_lossy()
-      .to_string(),
+      .to_string()],
     extra_muc_features: vec![],
 
     // TODO

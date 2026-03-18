@@ -7,8 +7,7 @@ use xmpp_parsers::jingle_rtcp_fb::RtcpFb;
 
 use crate::source::{MediaType, Source};
 
-pub(super) const RTP_HDREXT_SSRC_AUDIO_LEVEL: &str =
-  "urn:ietf:params:rtp-hdrext:ssrc-audio-level";
+pub(super) const RTP_HDREXT_SSRC_AUDIO_LEVEL: &str = "urn:ietf:params:rtp-hdrext:ssrc-audio-level";
 pub(super) const RTP_HDREXT_TRANSPORT_CC: &str =
   "http://www.ietf.org/id/draft-holmer-rmcat-transport-wide-cc-extensions-01";
 
@@ -19,6 +18,12 @@ pub(crate) enum CodecName {
   Vp8,
   Vp9,
   Av1,
+}
+
+impl CodecName {
+  pub(crate) fn all_video_names() -> &'static [&'static str] {
+    &["vp9", "vp8", "h264"]
+  }
 }
 
 #[derive(Clone)]
@@ -37,8 +42,7 @@ impl Codec {
   pub(crate) fn is_rtx(&self, rtx_pt: u8) -> bool {
     if let Some(pt) = self.rtx_pt {
       pt == rtx_pt
-    }
-    else {
+    } else {
       false
     }
   }
@@ -136,13 +140,11 @@ pub(super) fn parse_rtp_description(
     for hdrext in description.hdrexts.iter() {
       if hdrext.uri == RTP_HDREXT_SSRC_AUDIO_LEVEL {
         audio_hdrext_ssrc_audio_level = Some(hdrext.id);
-      }
-      else if hdrext.uri == RTP_HDREXT_TRANSPORT_CC {
+      } else if hdrext.uri == RTP_HDREXT_TRANSPORT_CC {
         audio_hdrext_transport_cc = Some(hdrext.id);
       }
     }
-  }
-  else if description.media == "video" {
+  } else if description.media == "video" {
     for pt in description.payload_types.iter() {
       if let Some(name) = &pt.name {
         match name.as_str() {
@@ -218,25 +220,15 @@ pub(super) fn parse_rtp_description(
         video_hdrext_transport_cc = Some(hdrext.id);
       }
     }
-  }
-  else {
+  } else {
     debug!("skipping media: {}", description.media);
     return Ok(None);
   }
 
-  let codecs = [opus, h264, vp8, vp9, av1]
-    .iter()
-    .flatten()
-    .cloned()
-    .collect();
+  let codecs = [opus, h264, vp8, vp9, av1].iter().flatten().cloned().collect();
 
   for ssrc in &description.ssrcs {
-    let owner = ssrc
-      .info
-      .as_ref()
-      .context("missing ssrc-info")?
-      .owner
-      .clone();
+    let owner = ssrc.info.as_ref().context("missing ssrc-info")?.owner.clone();
 
     debug!("adding ssrc to remote_ssrc_map: {:?}", ssrc);
     remote_ssrc_map.insert(
@@ -246,8 +238,7 @@ pub(super) fn parse_rtp_description(
         participant_id: super::participant_id_for_owner(owner)?,
         media_type: if description.media == "audio" {
           MediaType::Audio
-        }
-        else {
+        } else {
           MediaType::Video
         },
       },

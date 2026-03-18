@@ -27,7 +27,7 @@ use xmpp_parsers::{
 use crate::{
   colibri::ColibriChannel,
   conference::JitsiConference,
-  pipeline::{CodecName, MediaPipeline},
+  pipeline::{CodecName, MediaPipeline, PipelineBuildConfig},
   util::generate_id,
 };
 
@@ -143,16 +143,18 @@ impl JingleSession {
     let media_pipeline = MediaPipeline::build(
       conference,
       ice_transport,
-      codecs.clone(),
-      audio_hdrext_ssrc_audio_level,
-      audio_hdrext_transport_cc,
-      video_hdrext_transport_cc,
-      remote_ssrc_map,
-      &dtls_cert_pem,
-      &dtls_private_key_pem,
-      audio_ssrc,
-      video_ssrc,
-      video_rtx_ssrc,
+      PipelineBuildConfig {
+        codecs: codecs.clone(),
+        audio_hdrext_ssrc_audio_level,
+        audio_hdrext_transport_cc,
+        video_hdrext_transport_cc,
+        remote_ssrc_map,
+        dtls_cert_pem,
+        dtls_private_key_pem,
+        audio_ssrc,
+        video_ssrc,
+        video_rtx_ssrc,
+      },
     )
     .await?;
 
@@ -190,8 +192,8 @@ impl JingleSession {
       }
       else {
         let mut pts = vec![];
-        let codec_name = conference.config.video_codec.as_str();
-        let codec = codecs.iter().find(|codec| codec.is_codec(codec_name));
+        let codec = conference.config.video_codecs.iter()
+          .find_map(|name| codecs.iter().find(|codec| codec.is_codec(name.as_str())));
         if let Some(codec) = codec {
           let mut pt = PayloadType::new(codec.pt, codec.encoding_name().to_owned(), 90000, 1);
           pt.rtcp_fbs = codec.rtcp_fbs.clone();
@@ -212,7 +214,7 @@ impl JingleSession {
           }
         }
         else {
-          bail!("unsupported video codec: {}", codec_name);
+          bail!("unsupported video codec(s): {:?}", conference.config.video_codecs);
         }
         pts
       };

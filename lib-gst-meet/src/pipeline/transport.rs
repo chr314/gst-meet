@@ -1,9 +1,9 @@
-use anyhow::{Context, Result};
 #[cfg(feature = "log-rtp")]
 use anyhow::anyhow;
+use anyhow::{Context, Result};
 use gstreamer::{
-  prelude::{ElementExt as _, ElementExtManual as _, GstBinExt as _},
-  GhostPad,
+    prelude::{ElementExt as _, ElementExtManual as _, GstBinExt as _},
+    GhostPad,
 };
 use nice_gst_meet as nice;
 use tracing::debug;
@@ -55,10 +55,7 @@ pub(super) fn build_transport_bin(
 
   let dtlssrtpdec = gstreamer::ElementFactory::make("dtlssrtpdec")
     .property("connection-id", dtls_srtp_connection_id)
-    .property(
-      "pem",
-      format!("{}\n{}", dtls_cert_pem, dtls_private_key_pem),
-    )
+    .property("pem", format!("{}\n{}", dtls_cert_pem, dtls_private_key_pem))
     .build()?;
   bin.add(&dtlssrtpdec)?;
 

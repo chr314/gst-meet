@@ -15,7 +15,7 @@ async-stream = { version = "0.3", default-features = false }
 async-trait = { version = "0.1", default-features = false }
 base64 = { version = "0.22", default-features = false }
 bytes = { version = "1", default-features = false, features = ["std"] }
-colibri = { version = "0.2", default-features = false }
+colibri = { path = "../colibri", default-features = false }
 futures = { version = "0.3", default-features = false }
 glib = { version = "0.22", default-features = false }
 gstreamer = { version = "0.25", default-features = false, features = ["v1_20"] }

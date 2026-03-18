@@ -40,6 +40,7 @@ use xmpp_parsers::{
 use crate::{
   colibri::ColibriChannel,
   jingle::JingleSession,
+  pipeline::CodecName,
   source::MediaType,
   stanza_filter::StanzaFilter,
   util::generate_id,
@@ -83,7 +84,7 @@ pub struct JitsiConferenceConfig {
   pub focus: Jid,
   pub nick: String,
   pub region: Option<String>,
-  pub video_codec: String,
+  pub video_codecs: Vec<String>,
   pub extra_muc_features: Vec<String>,
 
   pub start_bitrate: u32,
@@ -191,11 +192,14 @@ impl JitsiConference {
         .append("gst-meet")
         .build(),
       Element::builder("jitsi_participant_codecType", ns::DEFAULT_NS)
-        .append(config.video_codec.as_str())
+        .append(config.video_codecs.first().map(|s| s.as_str()).unwrap_or(""))
         .build(),
       Element::builder("jitsi_participant_codecList", ns::DEFAULT_NS)
-        .append(config.video_codec.as_str())
+        .append(config.video_codecs.join(",").as_str())
         .build(),
+      // Element::builder("jitsi_participant_codecList", ns::DEFAULT_NS)
+      //     .append(CodecName::all_video_names().join(",").as_str())
+      //     .build(),
       // TODO: mute state should be based on whether there is a corresponding element in the send pipeline
       Element::builder("audiomuted", ns::DEFAULT_NS)
         .append("false")
@@ -720,15 +724,12 @@ impl StanzaFilter for JitsiConference {
                       let my_endpoint_id = my_endpoint_id.clone();
                       let colibri_channel = colibri_channel.clone();
                       let self_ = self.clone();
+                      let remote_ssrc_map = jingle_session.media_pipeline.remote_ssrc_map.clone();
                       jingle_session.stats_handler_task = Some(tokio::spawn(async move {
                         let mut interval = time::interval(SEND_STATS_INTERVAL);
                         loop {
-                          let maybe_remote_ssrc_map = self_
-                            .jingle_session
-                            .lock()
-                            .await
-                            .as_ref()
-                            .map(|sess| sess.media_pipeline.remote_ssrc_map.clone());
+                          let maybe_remote_ssrc_map: Option<std::collections::HashMap<u32, _>> =
+                            remote_ssrc_map.read().ok().map(|g| g.clone());
                           let maybe_source_stats: Option<Vec<gstreamer::Structure>> = self_
                             .pipeline()
                             .await
