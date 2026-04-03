@@ -11,6 +11,7 @@ authors = ["Jasper Hugo <jasper@avstack.io>"]
 
 [dependencies]
 anyhow = { version = "1", default-features = false, features = ["std"] }
+bon = { version = "3", default-features = false, features = ["std"] }
 async-stream = { version = "0.3", default-features = false }
 async-trait = { version = "0.1", default-features = false }
 base64 = { version = "0.22", default-features = false }

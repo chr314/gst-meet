@@ -112,6 +112,18 @@ impl JingleSession {
       }
     }
 
+    // Keep only audio codecs + video codecs that match the configured preference.
+    // This ensures request-pt-map never advertises support for unwanted codecs (e.g. AV1
+    // sent by JVB for screenshare even when not in video_codecs).
+    codecs.retain(|codec| {
+      codec.is_audio()
+        || conference
+          .config
+          .video_codecs
+          .iter()
+          .any(|name| codec.is_codec(name.as_str()))
+    });
+
     let ice_transport = ice_transport.context("missing ICE transport")?;
 
     if let Some(remote_fingerprint) = &ice_transport.fingerprint {
@@ -165,7 +177,6 @@ impl JingleSession {
     let local_candidates = media_pipeline.ice_local_candidates();
     debug!("local candidates: {:?}", local_candidates);
 
-    debug!("building Jingle session-accept");
     let mut jingle_accept = Jingle::new(Action::SessionAccept, jingle.sid.clone())
       .with_initiator(
         jingle

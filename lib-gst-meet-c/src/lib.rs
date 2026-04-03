@@ -150,37 +150,25 @@ pub unsafe extern "C" fn gstmeet_connection_join_conference(
         .to_string(),
     )
   };
-  let config = JitsiConferenceConfig {
-    muc,
-    focus,
-    nick: CStr::from_ptr((*config).nick).to_string_lossy().to_string(),
-    region,
-    video_codecs: vec![CStr::from_ptr((*config).video_codec)
-      .to_string_lossy()
-      .to_string()],
-    extra_muc_features: vec![],
-
-    // TODO
-    start_bitrate: 800,
-    stereo: false,
-
-    recv_video_scale_width: 1280,
-    recv_video_scale_height: 720,
-
-    buffer_size: 200,
+  let config = {
+    #[allow(unused_mut, unused_variables)]
+    let mut b = JitsiConferenceConfig::builder()
+      .muc(muc)
+      .focus(focus)
+      .nick(CStr::from_ptr((*config).nick).to_string_lossy().to_string())
+      .video_codecs(vec![CStr::from_ptr((*config).video_codec)
+        .to_string_lossy()
+        .to_string()])
+      .maybe_region(region);
 
     #[cfg(feature = "log-rtp")]
-    log_rtp: false,
-    #[cfg(feature = "log-rtp")]
-    log_rtcp: false,
+    let b = b.log_rtp(false).log_rtcp(false);
+
+    b.build()
   };
   (*context)
     .runtime
-    .block_on(JitsiConference::join(
-      (*connection).clone(),
-      from_glib_full(glib_main_context),
-      config,
-    ))
+    .block_on(JitsiConference::join((*connection).clone(), config))
     .ok_raw_or_log()
 }
 
@@ -261,9 +249,11 @@ pub unsafe extern "C" fn gstmeet_conference_on_participant(
   ctx: *mut c_void,
 ) {
   let ctx = Arc::new(AtomicPtr::new(ctx));
+  let conference_clone = (*conference).clone();
   (*context).runtime.block_on(
-    (*conference).on_participant(move |conference, participant| {
+    (*conference).on_participant(move |participant| {
       let ctx = ctx.clone();
+      let conf = conference_clone.clone();
       Box::pin(async move {
         let participant = Participant {
           jid: participant
@@ -281,7 +271,7 @@ pub unsafe extern "C" fn gstmeet_conference_on_participant(
             .unwrap_or_else(ptr::null),
         };
         f(
-          Box::into_raw(Box::new(conference)),
+          Box::into_raw(Box::new(conf)),
           participant,
           ctx.load(Ordering::Relaxed),
         );

@@ -12,7 +12,7 @@ mod xmpp;
 pub use xmpp_parsers;
 
 pub use crate::{
-  conference::{Feature, JitsiConference, JitsiConferenceConfig, Participant},
+  conference::{BoxedResultFuture, Feature, JitsiConference, JitsiConferenceConfig, Participant, StreamEvent, StreamEventKind, StreamInfo},
   source::MediaType,
   stanza_filter::StanzaFilter,
   xmpp::connection::{Authentication, Connection},

@@ -3,7 +3,7 @@ use std::{collections::HashMap, time::Duration};
 use anyhow::{bail, Context, Result};
 #[cfg(target_os = "macos")]
 use cocoa::appkit::NSApplication;
-use colibri::{ColibriMessage, Constraints, VideoType};
+use colibri::{ColibriMessage, VideoType};
 use glib::object::ObjectExt as _;
 use gstreamer::{
   prelude::{ElementExt as _, ElementExtManual as _, GstBinExt as _},
@@ -11,11 +11,11 @@ use gstreamer::{
 };
 use http::Uri;
 use lib_gst_meet::{
-  init_tracing, Authentication, Connection, JitsiConference, JitsiConferenceConfig, MediaType,
+  init_tracing, Authentication, Connection, JitsiConferenceConfig, MediaType,
 };
 use structopt::StructOpt;
 use tokio::{signal::ctrl_c, task, time::timeout};
-use tracing::{error, info, trace, warn};
+use tracing::{info, trace, warn};
 
 #[derive(Debug, Clone, StructOpt)]
 #[structopt(
@@ -313,50 +313,44 @@ async fn main_inner() -> Result<()> {
     ..
   } = opt;
 
-  let config = JitsiConferenceConfig {
-    muc: room_jid.parse()?,
-    focus: focus_jid.parse()?,
-    nick,
-    region,
-    video_codecs: vec![video_codec],
-    extra_muc_features: vec![],
-    start_bitrate: start_bitrate.unwrap_or(800),
-    stereo: stereo.unwrap_or_default(),
-    recv_video_scale_height,
-    recv_video_scale_width,
-    buffer_size,
+  let config = {
+    #[allow(unused_mut)]
+    let mut b = JitsiConferenceConfig::builder()
+      .muc(room_jid.parse()?)
+      .focus(focus_jid.parse()?)
+      .nick(nick)
+      .video_codecs(vec![video_codec])
+      .recv_video_scale_width(recv_video_scale_width)
+      .recv_video_scale_height(recv_video_scale_height)
+      .buffer_size(buffer_size)
+      .send_resolution(send_video_height.into())
+      .maybe_region(region)
+      .start_bitrate(start_bitrate.unwrap_or(800))
+      .stereo(stereo.unwrap_or(false));
+
     #[cfg(feature = "log-rtp")]
-    log_rtp,
-    #[cfg(feature = "log-rtp")]
-    log_rtcp,
+    let b = b.log_rtp(log_rtp).log_rtcp(log_rtcp);
+
+    b.build()
   };
 
   let main_loop = glib::MainLoop::new(None, false);
 
-  let conference = JitsiConference::join(connection, main_loop.context(), config)
+  let conference = lib_gst_meet::JitsiConference::join(connection, config)
     .await
     .context("failed to join conference")?;
 
   conference
-    .set_send_resolution(send_video_height.into())
-    .await;
-
-  conference
-    .send_colibri_message(ColibriMessage::ReceiverVideoConstraints {
-      last_n: Some(opt.last_n.map(i32::from).unwrap_or(-1)),
-      selected_endpoints: opt
-        .select_endpoints
-        .map(|endpoints| endpoints.split(',').map(ToOwned::to_owned).collect()),
-      selected_sources: None,
-      on_stage_endpoints: None,
-      on_stage_sources: None,
-      default_constraints: Some(Constraints {
-        max_height: Some(opt.recv_video_scale_height.into()),
-        ideal_height: None,
-      }),
-      constraints: None,
-    })
+    .set_last_n(opt.last_n.map(i32::from).unwrap_or(-1))
     .await?;
+  conference
+    .set_max_receive_height(opt.recv_video_scale_height)
+    .await?;
+  if let Some(endpoints) = opt.select_endpoints {
+    conference
+      .set_selected_endpoints(endpoints.split(',').map(ToOwned::to_owned).collect())
+      .await?;
+  }
 
   if let Some(video_type) = opt.video_type {
     conference
@@ -399,28 +393,31 @@ async fn main_inner() -> Result<()> {
   if let Some(bin) = recv_pipeline {
     conference.add_bin(&bin).await?;
 
-    if let Some(audio_element) = bin.by_name("audio") {
-      info!(
-        "recv pipeline has an audio element, a sink pad will be requested from it for each participant"
-      );
-      conference
-        .set_remote_participant_audio_sink_element(Some(audio_element))
-        .await;
-    }
+    let audio_sink = bin.by_name("audio");
+    let video_sink = bin.by_name("video");
 
-    if let Some(video_element) = bin.by_name("video") {
-      info!(
-        "recv pipeline has a video element, a sink pad will be requested from it for each participant"
-      );
+    if audio_sink.is_some() || video_sink.is_some() {
       conference
-        .set_remote_participant_video_sink_element(Some(video_element))
+        .set_stream_sink_factory(move |info| {
+          if info.media_type.is_audio() {
+            audio_sink.clone()
+          }
+          else if info.media_type.is_video() {
+            video_sink.clone()
+          }
+          else {
+            None
+          }
+        })
         .await;
     }
   }
 
+  let conference_c = conference.clone();
   conference
-    .on_participant(move |conference, participant| {
+    .on_participant(move |participant| {
       let recv_pipeline_participant_template = recv_pipeline_participant_template.clone();
+      let conference = conference_c.clone();
       Box::pin(async move {
         info!("New participant: {:?}", participant);
 
@@ -484,7 +481,7 @@ async fn main_inner() -> Result<()> {
     .await;
 
   conference
-    .on_participant_left(move |_conference, participant| {
+    .on_participant_left(move |participant| {
       Box::pin(async move {
         info!("Participant left: {:?}", participant);
         Ok(())
@@ -493,7 +490,7 @@ async fn main_inner() -> Result<()> {
     .await;
 
   conference
-    .on_colibri_message(move |_conference, message| {
+    .on_colibri_message(move |message| {
       Box::pin(async move {
         info!("Colibri message: {:?}", message);
         Ok(())

@@ -1,24 +1,25 @@
 use std::{
   collections::HashMap,
-  sync::{Arc, RwLock},
+  sync::{Arc, Mutex},
 };
 
 use anyhow::{Context, Result};
 use glib::prelude::{Cast as _, ToValue as _};
-use gstreamer::prelude::{ElementExt as _, GstBinExt as _, ObjectExt as _};
+use gstreamer::prelude::{ElementExt as _, GstBinExt as _, GstObjectExt as _, ObjectExt as _};
 use tokio::sync::oneshot;
 use tracing::{debug, error, warn};
 
-use crate::source::{MediaType, Source};
-
-use super::codec::{Codec, RTP_HDREXT_SSRC_AUDIO_LEVEL, RTP_HDREXT_TRANSPORT_CC};
+use super::{
+  codec::{Codec, RTP_HDREXT_SSRC_AUDIO_LEVEL, RTP_HDREXT_TRANSPORT_CC},
+  decode::SsrcState,
+};
 
 pub(crate) struct PipelineBuildConfig {
   pub(crate) codecs: Vec<Codec>,
   pub(crate) audio_hdrext_ssrc_audio_level: Option<u16>,
   pub(crate) audio_hdrext_transport_cc: Option<u16>,
   pub(crate) video_hdrext_transport_cc: Option<u16>,
-  pub(crate) remote_ssrc_map: HashMap<u32, Source>,
+  pub(crate) remote_ssrc_map: HashMap<u32, crate::source::Source>,
   pub(crate) dtls_cert_pem: String,
   pub(crate) dtls_private_key_pem: String,
   pub(crate) audio_ssrc: u32,
@@ -64,7 +65,8 @@ pub(super) fn connect_request_pt_map(
             if let Some(hdrext) = audio_hdrext_transport_cc {
               caps = caps.field(&format!("extmap-{}", hdrext), RTP_HDREXT_TRANSPORT_CC);
             }
-          } else {
+          }
+          else {
             caps = caps
               .field("media", "video")
               .field("clock-rate", 90000)
@@ -76,7 +78,8 @@ pub(super) fn connect_request_pt_map(
             }
           }
           return Ok::<_, anyhow::Error>(Some(caps.build()));
-        } else if codec.is_rtx(pt) {
+        }
+        else if codec.is_rtx(pt) {
           caps = caps
             .field("media", "video")
             .field("clock-rate", 90000)
@@ -94,10 +97,12 @@ pub(super) fn connect_request_pt_map(
         debug!("mapped pt to caps: {:?}", caps);
         Some(caps.to_value())
       },
-      Ok(None) => None,
+      // Return empty caps for unknown PTs — glib 0.22 panics if the signal
+      // callback returns None for a non-nullable return type.
+      Ok(None) => Some(gstreamer::Caps::new_empty().to_value()),
       Err(e) => {
         error!("handling request-pt-map: {:?}", e);
-        None
+        Some(gstreamer::Caps::new_empty().to_value())
       },
     }
   });
@@ -106,32 +111,42 @@ pub(super) fn connect_request_pt_map(
 /// Connects the `new-jitterbuffer` signal that enables retransmission and configures latency.
 pub(super) fn connect_new_jitterbuffer(
   rtpbin: &gstreamer::Element,
-  remote_ssrc_map: &Arc<RwLock<HashMap<u32, Source>>>,
+  ssrc_registry: &Arc<Mutex<HashMap<u32, SsrcState>>>,
   buffer_size: u32,
 ) {
-  let remote_ssrc_map = remote_ssrc_map.clone();
+  let ssrc_registry = ssrc_registry.clone();
   rtpbin.connect("new-jitterbuffer", false, move |values| {
-    let remote_ssrc_map = remote_ssrc_map.clone();
+    let ssrc_registry = ssrc_registry.clone();
     let f = move || {
       let rtpjitterbuffer: gstreamer::Element = values[1].get()?;
       let session: u32 = values[2].get()?;
       let ssrc: u32 = values[3].get()?;
       debug!("new jitterbuffer created for session {} ssrc {}", session, ssrc);
 
-      let source = remote_ssrc_map
-        .read()
-        .map_err(|e| anyhow::anyhow!("remote_ssrc_map lock poisoned: {}", e))?
+      let (media_type, participant_id) = match ssrc_registry
+        .lock()
+        .map_err(|e| anyhow::anyhow!("ssrc_registry lock poisoned: {}", e))?
         .get(&ssrc)
-        .context(format!("unknown ssrc: {}", ssrc))?
-        .clone();
-      debug!("jitterbuffer is for remote source: {:?}", source);
-      if source.media_type == MediaType::Video && source.participant_id.is_some() {
+      {
+        Some(SsrcState::Signaled { media_type, participant_id }) => (*media_type, participant_id.clone()),
+        Some(SsrcState::Active { media_type, participant_id, .. }) => (*media_type, Some(participant_id.clone())),
+        Some(SsrcState::Pending { .. }) => {
+          warn!("new-jitterbuffer for pending ssrc {} (no media type known yet)", ssrc);
+          return Ok::<_, anyhow::Error>(());
+        },
+        None => {
+          warn!("new-jitterbuffer for unknown ssrc {}", ssrc);
+          return Ok(());
+        },
+      };
+
+      if media_type.is_video() && participant_id.is_some() {
         debug!("enabling RTX for ssrc {}", ssrc);
         rtpjitterbuffer.set_property("do-retransmission", true);
         rtpjitterbuffer.set_property("drop-on-latency", true);
         rtpjitterbuffer.set_property("latency", buffer_size);
       }
-      Ok::<_, anyhow::Error>(())
+      Ok(())
     };
     if let Err(e) = f() {
       warn!("new-jitterbuffer: {:?}", e);
@@ -237,8 +252,14 @@ pub(super) fn setup_bus_monitor(pipeline: &gstreamer::Pipeline) -> Result<onesho
     while let Some(msg) = stream.next().await {
       match msg.view() {
         gstreamer::MessageView::Error(e) => {
-          if let Some(d) = e.debug() {
-            error!("{}", d);
+          let src = msg
+            .src()
+            .map(|s| s.name().to_string())
+            .unwrap_or_else(|| "<unknown>".into());
+          error!("GStreamer error from {}: {} (debug: {:?})", src, e.error(), e.debug());
+          // Transition the pipeline to Null so pipeline_stopped() unblocks.
+          if let Some(pipeline) = pipeline_weak.upgrade() {
+            let _ = pipeline.set_state(gstreamer::State::Null);
           }
         },
         gstreamer::MessageView::Warning(e) => {

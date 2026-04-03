@@ -230,17 +230,12 @@ pub(super) fn parse_rtp_description(
   for ssrc in &description.ssrcs {
     let owner = ssrc.info.as_ref().context("missing ssrc-info")?.owner.clone();
 
-    debug!("adding ssrc to remote_ssrc_map: {:?}", ssrc);
     remote_ssrc_map.insert(
       ssrc.id,
       Source {
         ssrc: ssrc.id,
         participant_id: super::participant_id_for_owner(owner)?,
-        media_type: if description.media == "audio" {
-          MediaType::Audio
-        } else {
-          MediaType::Video
-        },
+        media_type: MediaType::classify(&description.media, ssrc.video_type.as_deref()),
       },
     );
   }

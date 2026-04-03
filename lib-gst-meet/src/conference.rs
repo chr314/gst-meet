@@ -2,6 +2,8 @@ use std::{
   collections::HashMap, convert::TryFrom, fmt, future::Future, pin::Pin, sync::Arc, time::Duration,
 };
 
+use bon::Builder;
+
 use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
 use colibri::{ColibriMessage, JsonMessage};
@@ -78,23 +80,30 @@ enum JitsiConferenceState {
   Idle,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Builder, Debug, Clone)]
 pub struct JitsiConferenceConfig {
   pub muc: BareJid,
   pub focus: Jid,
   pub nick: String,
   pub region: Option<String>,
+  #[builder(default = vec!["vp8".to_owned()])]
   pub video_codecs: Vec<String>,
+  #[builder(default)]
   pub extra_muc_features: Vec<String>,
-
+  #[builder(default = 800)]
   pub start_bitrate: u32,
+  #[builder(default)]
   pub stereo: bool,
-
+  #[builder(default = 1280)]
   pub recv_video_scale_width: u16,
+  #[builder(default = 720)]
   pub recv_video_scale_height: u16,
-
+  #[builder(default = 200)]
   pub buffer_size: u32,
-
+  /// Informational: the max resolution we are currently sending.
+  /// Broadcast to other participants in stats so their clients can display it.
+  /// lib-gst-meet does not encode video itself; this is purely informational.
+  pub send_resolution: Option<i32>,
   #[cfg(feature = "log-rtp")]
   pub log_rtp: bool,
   #[cfg(feature = "log-rtp")]
@@ -130,21 +139,39 @@ pub struct Participant {
   pub nick: Option<String>,
 }
 
-type BoxedResultFuture = Pin<Box<dyn Future<Output = Result<()>> + Send>>;
+pub type BoxedResultFuture = Pin<Box<dyn Future<Output = Result<()>> + Send>>;
+
+/// Passed to the sink factory to identify the stream being activated.
+#[derive(Debug, Clone)]
+pub struct StreamInfo {
+  pub participant_id: String,
+  pub ssrc: u32,
+  pub media_type: MediaType,
+}
+
+/// Event fired when a remote stream is activated or removed.
+pub struct StreamEvent {
+  pub participant_id: String,
+  pub ssrc: u32,
+  pub media_type: MediaType,
+  pub kind: StreamEventKind,
+}
+
+pub enum StreamEventKind {
+  /// A new stream is active and linked downstream. Use for notification only.
+  Added,
+  Removed,
+}
 
 pub(crate) struct JitsiConferenceInner {
   participants: HashMap<jid::ResourcePart, Participant>,
-  audio_sink: Option<gstreamer::Element>,
-  video_sink: Option<gstreamer::Element>,
-  on_participant:
-    Option<Arc<dyn (Fn(JitsiConference, Participant) -> BoxedResultFuture) + Send + Sync>>,
-  on_participant_left:
-    Option<Arc<dyn (Fn(JitsiConference, Participant) -> BoxedResultFuture) + Send + Sync>>,
-  on_colibri_message:
-    Option<Arc<dyn (Fn(JitsiConference, ColibriMessage) -> BoxedResultFuture) + Send + Sync>>,
+  on_remote_stream: Option<Arc<dyn Fn(StreamEvent) -> BoxedResultFuture + Send + Sync>>,
+  on_participant: Option<Arc<dyn (Fn(Participant) -> BoxedResultFuture) + Send + Sync>>,
+  on_participant_left: Option<Arc<dyn (Fn(Participant) -> BoxedResultFuture) + Send + Sync>>,
+  on_colibri_message: Option<Arc<dyn (Fn(ColibriMessage) -> BoxedResultFuture) + Send + Sync>>,
+  sink_factory: Option<Arc<dyn Fn(StreamInfo) -> Option<gstreamer::Element> + Send + Sync>>,
   presence: Vec<Element>,
   state: JitsiConferenceState,
-  send_resolution: Option<i32>,
   connected_tx: Option<oneshot::Sender<()>>,
 }
 
@@ -158,11 +185,8 @@ impl fmt::Debug for JitsiConferenceInner {
 
 impl JitsiConference {
   #[tracing::instrument(level = "debug", err)]
-  pub async fn join(
-    xmpp_connection: Connection,
-    glib_main_context: glib::MainContext,
-    config: JitsiConferenceConfig,
-  ) -> Result<Self> {
+  pub async fn join(xmpp_connection: Connection, config: JitsiConferenceConfig) -> Result<Self> {
+    let glib_main_context = glib::MainContext::default();
     let conference_stanza = xmpp::jitsi::Conference {
       machine_uid: Uuid::new_v4().to_string(),
       room: config.muc.to_string(),
@@ -250,12 +274,11 @@ impl JitsiConference {
         state: JitsiConferenceState::Discovering,
         presence,
         participants: HashMap::new(),
-        audio_sink: None,
-        video_sink: None,
+        on_remote_stream: None,
         on_participant: None,
         on_participant_left: None,
         on_colibri_message: None,
-        send_resolution: None,
+        sink_factory: None,
         connected_tx: Some(tx),
       })),
       tls_insecure: xmpp_connection.tls_insecure,
@@ -274,19 +297,14 @@ impl JitsiConference {
   #[tracing::instrument(level = "debug", err)]
   pub async fn leave(self) -> Result<()> {
     if let Some(jingle_session) = self.jingle_session.lock().await.take() {
-      debug!("pausing all sinks");
       jingle_session.pause_all_sinks();
 
-      debug!("setting pipeline state to NULL");
       if let Err(e) = jingle_session.pipeline().set_state(gstreamer::State::Null) {
         warn!("failed to set pipeline state to NULL: {:?}", e);
       }
 
-      debug!("waiting for state change to complete");
       let _ = jingle_session.pipeline_stopped().await;
     }
-
-    // should leave the XMPP muc gracefully, instead of just disconnecting
 
     Ok(())
   }
@@ -363,20 +381,50 @@ impl JitsiConference {
     Ok(())
   }
 
-  pub async fn remote_participant_audio_sink_element(&self) -> Option<gstreamer::Element> {
-    self.inner.lock().await.audio_sink.as_ref().cloned()
+  /// Register a callback that fires for every remote stream that is added or removed.
+  pub async fn on_remote_stream(
+    &self,
+    f: impl Fn(StreamEvent) -> BoxedResultFuture + Send + Sync + 'static,
+  ) {
+    self.inner.lock().await.on_remote_stream = Some(Arc::new(f));
   }
 
-  pub async fn set_remote_participant_audio_sink_element(&self, sink: Option<gstreamer::Element>) {
-    self.inner.lock().await.audio_sink = sink;
+  pub(crate) async fn has_stream_handler(&self) -> bool {
+    self.inner.lock().await.on_remote_stream.is_some()
   }
 
-  pub async fn remote_participant_video_sink_element(&self) -> Option<gstreamer::Element> {
-    self.inner.lock().await.video_sink.as_ref().cloned()
+  /// Register a factory that provides a downstream sink element for each new stream.
+  /// Called synchronously before the stream's upstream pad is connected, so the lib
+  /// can link downstream before data starts flowing.
+  ///
+  /// Return `Some(element)` to route the stream there, or `None` to use a fakesink.
+  /// For a global per-media-type sink (e.g. `audiomixer`) the element should already
+  /// be in a bin (added via `add_bin`); the lib will use a ghost pad to bridge the
+  /// bin boundary. For a per-stream element (e.g. `appsink`) leave it parentless and
+  /// the lib will add it directly to its internal pipeline.
+  pub async fn set_stream_sink_factory(
+    &self,
+    f: impl Fn(StreamInfo) -> Option<gstreamer::Element> + Send + Sync + 'static,
+  ) {
+    self.inner.lock().await.sink_factory = Some(Arc::new(f));
   }
 
-  pub async fn set_remote_participant_video_sink_element(&self, sink: Option<gstreamer::Element>) {
-    self.inner.lock().await.video_sink = sink;
+  pub(crate) async fn call_sink_factory(
+    &self,
+    info: StreamInfo,
+  ) -> Option<gstreamer::Element> {
+    let factory = self.inner.lock().await.sink_factory.clone();
+    factory.and_then(|f| f(info))
+  }
+
+  /// Fire a `StreamEvent` to the registered callback, if any.
+  pub(crate) async fn fire_stream_event(&self, event: StreamEvent) {
+    let f = self.inner.lock().await.on_remote_stream.clone();
+    if let Some(f) = f {
+      if let Err(e) = f(event).await {
+        warn!("on_remote_stream callback failed: {:?}", e);
+      }
+    }
   }
 
   pub async fn audio_sink_element(&self) -> Result<gstreamer::Element> {
@@ -403,17 +451,6 @@ impl JitsiConference {
     )
   }
 
-  /// Set the max resolution that we are currently sending.
-  ///
-  /// Setting this is required for browser clients in the same conference to display
-  /// the stats that we broadcast.
-  ///
-  /// Note that lib-gst-meet does not encode video (that is the responsibility of your
-  /// GStreamer pipeline), so this is purely informational.
-  pub async fn set_send_resolution(&self, height: i32) {
-    self.inner.lock().await.send_resolution = Some(height);
-  }
-
   pub async fn send_colibri_message(&self, message: ColibriMessage) -> Result<()> {
     self
       .jingle_session
@@ -425,6 +462,55 @@ impl JitsiConference {
       .as_ref()
       .context("no colibri channel")?
       .send(message)
+      .await
+  }
+
+  /// Set the maximum number of video streams to receive. Pass `-1` for unlimited.
+  pub async fn set_last_n(&self, n: i32) -> Result<()> {
+    self
+      .send_colibri_message(ColibriMessage::ReceiverVideoConstraints {
+        last_n: Some(n),
+        selected_endpoints: None,
+        selected_sources: None,
+        on_stage_endpoints: None,
+        on_stage_sources: None,
+        default_constraints: None,
+        constraints: None,
+      })
+      .await
+  }
+
+  /// Set the maximum height we want to receive video at. JVB will downscale above this.
+  pub async fn set_max_receive_height(&self, height: u16) -> Result<()> {
+    self
+      .send_colibri_message(ColibriMessage::ReceiverVideoConstraints {
+        last_n: None,
+        selected_endpoints: None,
+        selected_sources: None,
+        on_stage_endpoints: None,
+        on_stage_sources: None,
+        default_constraints: Some(colibri::Constraints {
+          max_height: Some(height.into()),
+          ideal_height: None,
+        }),
+        constraints: None,
+      })
+      .await
+  }
+
+  /// Select (prioritise) specific endpoints for video delivery.
+  /// JVB will prefer to send video from these endpoints even when `last_n` would normally exclude them.
+  pub async fn set_selected_endpoints(&self, endpoint_ids: Vec<String>) -> Result<()> {
+    self
+      .send_colibri_message(ColibriMessage::ReceiverVideoConstraints {
+        last_n: None,
+        selected_endpoints: Some(endpoint_ids),
+        selected_sources: None,
+        on_stage_endpoints: None,
+        on_stage_sources: None,
+        default_constraints: None,
+        constraints: None,
+      })
       .await
   }
 
@@ -457,7 +543,7 @@ impl JitsiConference {
       locked_inner.participants.insert(id, participant.clone());
       if let Some(f) = locked_inner.on_participant.as_ref().cloned() {
         drop(locked_inner);
-        if let Err(e) = f(self.clone(), participant.clone()).await {
+        if let Err(e) = f(participant.clone()).await {
           warn!("on_participant failed: {:?}", e);
         }
         else if let Ok(pipeline) = self.pipeline().await {
@@ -474,7 +560,7 @@ impl JitsiConference {
   #[tracing::instrument(level = "trace", skip(f))]
   pub async fn on_participant(
     &self,
-    f: impl (Fn(JitsiConference, Participant) -> BoxedResultFuture) + Send + Sync + 'static,
+    f: impl (Fn(Participant) -> BoxedResultFuture) + Send + Sync + 'static,
   ) {
     let f = Arc::new(f);
     let f2 = f.clone();
@@ -488,7 +574,7 @@ impl JitsiConference {
         "calling on_participant with existing participant: {:?}",
         participant
       );
-      if let Err(e) = f(self.clone(), participant.clone()).await {
+      if let Err(e) = f(participant.clone()).await {
         warn!("on_participant failed: {:?}", e);
       }
       else if let Ok(pipeline) = self.pipeline().await {
@@ -503,7 +589,7 @@ impl JitsiConference {
   #[tracing::instrument(level = "trace", skip(f))]
   pub async fn on_participant_left(
     &self,
-    f: impl (Fn(JitsiConference, Participant) -> BoxedResultFuture) + Send + Sync + 'static,
+    f: impl (Fn(Participant) -> BoxedResultFuture) + Send + Sync + 'static,
   ) {
     self.inner.lock().await.on_participant_left = Some(Arc::new(f));
   }
@@ -511,7 +597,7 @@ impl JitsiConference {
   #[tracing::instrument(level = "trace", skip(f))]
   pub async fn on_colibri_message(
     &self,
-    f: impl (Fn(JitsiConference, ColibriMessage) -> BoxedResultFuture) + Send + Sync + 'static,
+    f: impl (Fn(ColibriMessage) -> BoxedResultFuture) + Send + Sync + 'static,
   ) {
     self.inner.lock().await.on_colibri_message = Some(Arc::new(f));
   }
@@ -638,7 +724,6 @@ impl StanzaFilter for JitsiConference {
                 if let Some(from_jid) = header.from.as_ref().and_then(|j| j.try_as_full().ok().cloned()) {
                   if jingle.action == Action::SessionInitiate {
                     if from_jid.resource().as_str() == "focus" {
-                      // Acknowledge the IQ
                       let result_iq = Iq::empty_result(from_jid.clone().into(), header.id.clone())
                         .with_from(self.jid.clone().into());
                       self.xmpp_tx.send(result_iq.into()).await?;
@@ -653,7 +738,6 @@ impl StanzaFilter for JitsiConference {
                   else if jingle.action == Action::SourceAdd {
                     debug!("Received Jingle source-add");
 
-                    // Acknowledge the IQ
                     let result_iq = Iq::empty_result(from_jid.clone().into(), header.id.clone())
                       .with_from(self.jid.clone().into());
                     self.xmpp_tx.send(result_iq.into()).await?;
@@ -670,7 +754,6 @@ impl StanzaFilter for JitsiConference {
                   else if jingle.action == Action::SourceRemove {
                     debug!("Received Jingle source-remove");
 
-                    // Acknowledge the IQ
                     let result_iq = Iq::empty_result(from_jid.clone().into(), header.id.clone())
                       .with_from(self.jid.clone().into());
                     self.xmpp_tx.send(result_iq.into()).await?;
@@ -724,12 +807,15 @@ impl StanzaFilter for JitsiConference {
                       let my_endpoint_id = my_endpoint_id.clone();
                       let colibri_channel = colibri_channel.clone();
                       let self_ = self.clone();
-                      let remote_ssrc_map = jingle_session.media_pipeline.remote_ssrc_map.clone();
                       jingle_session.stats_handler_task = Some(tokio::spawn(async move {
                         let mut interval = time::interval(SEND_STATS_INTERVAL);
                         loop {
-                          let maybe_remote_ssrc_map: Option<std::collections::HashMap<u32, _>> =
-                            remote_ssrc_map.read().ok().map(|g| g.clone());
+                          let maybe_remote_ssrc_map = self_
+                            .jingle_session
+                            .lock()
+                            .await
+                            .as_ref()
+                            .map(|s| s.media_pipeline.remote_ssrc_snapshot());
                           let maybe_source_stats: Option<Vec<gstreamer::Structure>> = self_
                             .pipeline()
                             .await
@@ -759,7 +845,7 @@ impl StanzaFilter for JitsiConference {
                                   .ok()
                                   .and_then(|ssrc: u32| remote_ssrc_map.get(&ssrc))
                                   .map(|source| {
-                                    source.media_type == MediaType::Audio
+                                    source.media_type.is_audio()
                                       && source
                                         .participant_id
                                         .as_ref()
@@ -779,7 +865,7 @@ impl StanzaFilter for JitsiConference {
                                   .ok()
                                   .and_then(|ssrc: u32| remote_ssrc_map.get(&ssrc))
                                   .map(|source| {
-                                    source.media_type == MediaType::Video
+                                    source.media_type.is_video()
                                       && source
                                         .participant_id
                                         .as_ref()
@@ -799,7 +885,7 @@ impl StanzaFilter for JitsiConference {
                                   .ok()
                                   .and_then(|ssrc: u32| remote_ssrc_map.get(&ssrc))
                                   .map(|source| {
-                                    source.media_type == MediaType::Audio
+                                    source.media_type.is_audio()
                                       && source
                                         .participant_id
                                         .as_ref()
@@ -818,7 +904,7 @@ impl StanzaFilter for JitsiConference {
                                   .ok()
                                   .and_then(|ssrc: u32| remote_ssrc_map.get(&ssrc))
                                   .map(|source| {
-                                    source.media_type == MediaType::Video
+                                    source.media_type.is_video()
                                       && source
                                         .participant_id
                                         .as_ref()
@@ -890,7 +976,7 @@ impl StanzaFilter for JitsiConference {
                               connection_quality: 100.0,
                               jvb_rtt: Some(0), // TODO
                               server_region: self_.config.region.clone(),
-                              max_enabled_resolution: self_.inner.lock().await.send_resolution,
+                              max_enabled_resolution: self_.config.send_resolution,
                             };
                             if let Err(e) = colibri_channel.send(stats).await {
                               warn!("failed to send stats: {:?}", e);
@@ -909,7 +995,6 @@ impl StanzaFilter for JitsiConference {
                       tokio::spawn(async move {
                         let mut stream = ReceiverStream::new(rx);
                         while let Some(msg) = stream.next().await {
-                          // Some message types are handled internally rather than passed to the on_colibri_message handler.
                           let handled = match &msg {
                             ColibriMessage::EndpointMessage {
                               to: Some(to),
@@ -947,7 +1032,7 @@ impl StanzaFilter for JitsiConference {
 
                           let locked_inner = self_.inner.lock().await;
                           if let Some(f) = &locked_inner.on_colibri_message {
-                            if let Err(e) = f(self_.clone(), msg).await {
+                            if let Err(e) = f(msg).await {
                               warn!("on_colibri_message failed: {:?}", e);
                             }
                           }
@@ -1028,19 +1113,13 @@ impl StanzaFilter for JitsiConference {
                         .as_ref()
                         .cloned()
                       {
-                        debug!("calling on_participant_left with old participant");
-                        if let Err(e) = f(self.clone(), participant).await {
+                        if let Err(e) = f(participant).await {
                           warn!("on_participant_left failed: {:?}", e);
                         }
                       }
 
-                      // Clean up GStreamer pipeline elements for this participant
                       let participant_id = from.resource().as_str();
                       if let Some(session) = self.jingle_session.lock().await.as_mut() {
-                        debug!(
-                          "cleaning up pipeline elements for participant {}",
-                          participant_id
-                        );
                         session.media_pipeline.remove_participant(participant_id);
                       }
                     }
@@ -1054,8 +1133,7 @@ impl StanzaFilter for JitsiConference {
                     {
                       debug!("new participant: {:?}", jid);
                       if let Some(f) = &self.inner.lock().await.on_participant.as_ref().cloned() {
-                        debug!("calling on_participant with new participant");
-                        if let Err(e) = f(self.clone(), participant.clone()).await {
+                        if let Err(e) = f(participant.clone()).await {
                           warn!("on_participant failed: {:?}", e);
                         }
                         else if let Some(jingle_session) =
