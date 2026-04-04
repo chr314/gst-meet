@@ -97,10 +97,10 @@ pub(super) fn connect_request_pt_map(
         debug!("mapped pt to caps: {:?}", caps);
         Some(caps.to_value())
       },
-      Ok(None) => Some(gstreamer::Caps::new_any().to_value()),
+      Ok(None) => Some(Option::<gstreamer::Caps>::None.to_value()),
       Err(e) => {
         error!("handling request-pt-map: {:?}", e);
-        Some(gstreamer::Caps::new_any().to_value())
+        Some(Option::<gstreamer::Caps>::None.to_value())
       },
     }
   });
