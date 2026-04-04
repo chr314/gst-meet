@@ -6,7 +6,7 @@ use std::{
 use anyhow::{anyhow, Context, Result};
 use glib::prelude::{Cast as _, ToValue as _};
 use gstreamer::{
-    prelude::{ElementExt as _, GstBinExt as _, GstBinExtManual as _, GstObjectExt as _, ObjectExt as _, PadExt as _},
+    prelude::{ElementExt as _, GstBinExt as _, GstBinExtManual as _, GstObjectExt as _, ObjectExt as _, PadExt as _, PadExtManual as _},
     Bin,
 };
 use gstreamer_rtp::{prelude::RTPHeaderExtensionExt as _, RTPHeaderExtension};
@@ -249,11 +249,8 @@ pub(super) fn cleanup_ssrc(pipeline: &gstreamer::Pipeline, state: SsrcState, ssr
     } => {
       debug!("cleaning up pending ssrc {}", ssrc);
       if let Some(sink_pad) = fakesink.static_pad("sink") {
-        if let Err(e) = rtpbin_pad.unlink(&sink_pad) {
-          warn!(
-            "cleanup ssrc {}: failed to unlink rtpbin pad from pending fakesink: {:?}",
-            ssrc, e
-          );
+        if rtpbin_pad.peer().as_ref() == Some(&sink_pad) {
+          let _ = rtpbin_pad.unlink(&sink_pad);
         }
       }
       let _ = fakesink.set_state(gstreamer::State::Null);
@@ -425,6 +422,20 @@ pub(super) async fn activate_ssrc(
 
   if let Err(e) = pipeline.recalculate_latency() {
     warn!("recalculate_latency failed after adding decode bin: {:?}", e);
+  }
+
+  if media_type.is_video() {
+    let fku = gstreamer::Structure::builder("GstForceKeyUnit")
+      .field("running-time", gstreamer::ClockTime::NONE)
+      .field("all-headers", true)
+      .field("count", 0u32)
+      .build();
+    let event = gstreamer::event::CustomUpstream::builder(fku).build();
+    if let Some(sink) = decode_bin.static_pad("sink") {
+      if !sink.push_event(event) {
+        warn!("force-key-unit event not handled for ssrc {}", ssrc);
+      }
+    }
   }
 
   Ok(SsrcState::Active {

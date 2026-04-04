@@ -8,7 +8,7 @@ use futures::{
 };
 use rand::Rng;
 use tokio::{
-  sync::{mpsc, Mutex},
+  sync::{mpsc, watch, Mutex},
   time::sleep,
 };
 use tokio_stream::wrappers::ReceiverStream;
@@ -27,6 +27,7 @@ const CONNECT_RETRY_SLEEP: Duration = Duration::from_secs(3);
 pub(crate) struct ColibriChannel {
   send_tx: mpsc::Sender<ColibriMessage>,
   recv_tx: Arc<Mutex<Vec<mpsc::Sender<ColibriMessage>>>>,
+  jvb_closed: watch::Receiver<bool>,
 }
 
 impl ColibriChannel {
@@ -73,40 +74,54 @@ impl ColibriChannel {
 
     let (mut colibri_sink, mut colibri_stream) = colibri_websocket.split();
     let recv_tx: Arc<Mutex<Vec<mpsc::Sender<ColibriMessage>>>> = Arc::new(Mutex::new(vec![]));
+    let (jvb_closed_tx, jvb_closed_rx) = watch::channel(false);
     let recv_task = {
       let recv_tx = recv_tx.clone();
       tokio::spawn(async move {
-        while let Some(msg) = colibri_stream.try_next().await? {
-          match msg {
-            Message::Text(text) => {
-              debug!("Colibri <<< {}", text);
-              match serde_json::from_str::<ColibriMessage>(&text) {
-                Ok(colibri_msg) => {
-                  let mut txs = recv_tx.lock().await;
-                  let txs_clone = txs.clone();
-                  for (i, tx) in txs_clone.iter().enumerate().rev() {
-                    if tx.send(colibri_msg.clone()).await.is_err() {
-                      debug!("colibri subscriber closed, removing");
-                      txs.remove(i);
+        loop {
+          match colibri_stream.try_next().await {
+            Ok(Some(msg)) => match msg {
+              Message::Text(text) => {
+                debug!("Colibri <<< {}", text);
+                match serde_json::from_str::<ColibriMessage>(&text) {
+                  Ok(colibri_msg) => {
+                    let mut txs = recv_tx.lock().await;
+                    let txs_clone = txs.clone();
+                    for (i, tx) in txs_clone.iter().enumerate().rev() {
+                      if tx.send(colibri_msg.clone()).await.is_err() {
+                        debug!("colibri subscriber closed, removing");
+                        txs.remove(i);
+                      }
                     }
-                  }
-                },
-                Err(e) => warn!(
-                  "failed to parse frame on colibri websocket: {:?}\nframe: {}",
-                  e, text
-                ),
-              }
+                  },
+                  Err(e) => warn!(
+                    "failed to parse frame on colibri websocket: {:?}\nframe: {}",
+                    e, text
+                  ),
+                }
+              },
+              Message::Binary(data) => debug!(
+                "received unexpected {} byte binary frame on colibri websocket",
+                data.len()
+              ),
+              Message::Close(data) => {
+                debug!("received close frame on colibri websocket: {:}", data.map_or_else(|| "no reason".into(), |d| d.reason.to_string()));
+                let _ = jvb_closed_tx.send(true);
+                recv_tx.lock().await.clear();
+                break;
+              },
+              Message::Frame(_) | Message::Ping(_) | Message::Pong(_) => {},
             },
-            Message::Binary(data) => debug!(
-              "received unexpected {} byte binary frame on colibri websocket",
-              data.len()
-            ),
-            Message::Close(_) => {
-              debug!("received close frame on colibri websocket");
-              // TODO reconnect
+            Ok(None) => {
+              debug!("colibri websocket stream ended");
+              let _ = jvb_closed_tx.send(true);
+              recv_tx.lock().await.clear();
               break;
             },
-            Message::Frame(_) | Message::Ping(_) | Message::Pong(_) => {}, // handled automatically by tungstenite
+            Err(e) => {
+              error!("colibri websocket recv error: {:?}", e);
+              break;
+            },
           }
         }
         Ok::<_, anyhow::Error>(())
@@ -140,7 +155,11 @@ impl ColibriChannel {
       };
     });
 
-    Ok(Self { send_tx, recv_tx })
+    Ok(Self {
+      send_tx,
+      recv_tx,
+      jvb_closed: jvb_closed_rx,
+    })
   }
 
   pub(crate) async fn subscribe(&self, tx: mpsc::Sender<ColibriMessage>) {
@@ -150,5 +169,9 @@ impl ColibriChannel {
   pub(crate) async fn send(&self, msg: ColibriMessage) -> Result<()> {
     self.send_tx.send(msg).await?;
     Ok(())
+  }
+
+  pub(crate) fn jvb_closed_receiver(&self) -> watch::Receiver<bool> {
+    self.jvb_closed.clone()
   }
 }

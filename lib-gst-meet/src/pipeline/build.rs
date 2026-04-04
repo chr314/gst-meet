@@ -123,30 +123,34 @@ pub(super) fn connect_new_jitterbuffer(
       let ssrc: u32 = values[3].get()?;
       debug!("new jitterbuffer created for session {} ssrc {}", session, ssrc);
 
-      let (media_type, participant_id) = match ssrc_registry
+      let enable_rtx = match ssrc_registry
         .lock()
         .map_err(|e| anyhow::anyhow!("ssrc_registry lock poisoned: {}", e))?
         .get(&ssrc)
       {
-        Some(SsrcState::Signaled { media_type, participant_id }) => (*media_type, participant_id.clone()),
-        Some(SsrcState::Active { media_type, participant_id, .. }) => (*media_type, Some(participant_id.clone())),
+        Some(SsrcState::Signaled { media_type, participant_id }) => {
+          media_type.is_video() && participant_id.is_some()
+        },
+        Some(SsrcState::Active { media_type, participant_id, .. }) => {
+          media_type.is_video() && !participant_id.is_empty()
+        },
         Some(SsrcState::Pending { .. }) => {
           warn!("new-jitterbuffer for pending ssrc {} (no media type known yet)", ssrc);
-          return Ok::<_, anyhow::Error>(());
+          false
         },
         None => {
-          warn!("new-jitterbuffer for unknown ssrc {}", ssrc);
-          return Ok(());
+          warn!("new-jitterbuffer for unknown ssrc {} — speculatively enabling RTX", ssrc);
+          true
         },
       };
 
-      if media_type.is_video() && participant_id.is_some() {
+      if enable_rtx {
         debug!("enabling RTX for ssrc {}", ssrc);
         rtpjitterbuffer.set_property("do-retransmission", true);
-        rtpjitterbuffer.set_property("drop-on-latency", true);
+        rtpjitterbuffer.set_property("drop-on-latency", false);
         rtpjitterbuffer.set_property("latency", buffer_size);
       }
-      Ok(())
+      Ok::<_, anyhow::Error>(())
     };
     if let Err(e) = f() {
       warn!("new-jitterbuffer: {:?}", e);

@@ -504,6 +504,24 @@ async fn main_inner() -> Result<()> {
 
   let conference_ = conference.clone();
   let main_loop_ = main_loop.clone();
+  conference.on_conference_left(move || {
+      let conference_ = conference_.clone();
+      let main_loop_ = main_loop_.clone();
+      Box::pin(async move {
+        info!("Conference ended by remote — leaving...");
+        match timeout(Duration::from_secs(10), conference_.leave()).await {
+          Ok(Ok(_)) => {},
+          Ok(Err(e)) => warn!("Error leaving conference: {:?}", e),
+          Err(_) => warn!("Timed out leaving conference"),
+        }
+        main_loop_.quit();
+        Ok(())
+      })
+    })
+    .await;
+
+  let conference_ = conference.clone();
+  let main_loop_ = main_loop.clone();
   tokio::spawn(async move {
     ctrl_c().await.unwrap();
 

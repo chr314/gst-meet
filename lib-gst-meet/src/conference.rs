@@ -31,6 +31,7 @@ use xmpp_parsers::{
   ecaps2::{self, ECaps2},
   hashes::{Algo, Hash},
   iq::{Iq, IqPayload},
+  jingle::{Reason, ReasonElement},
   message::{Id as MessageId, Message, MessageType},
   muc::{user::Status as MucStatus, Muc, MucUser},
   nick::Nick,
@@ -169,6 +170,7 @@ pub(crate) struct JitsiConferenceInner {
   on_participant: Option<Arc<dyn (Fn(Participant) -> BoxedResultFuture) + Send + Sync>>,
   on_participant_left: Option<Arc<dyn (Fn(Participant) -> BoxedResultFuture) + Send + Sync>>,
   on_colibri_message: Option<Arc<dyn (Fn(ColibriMessage) -> BoxedResultFuture) + Send + Sync>>,
+  on_conference_left: Option<Arc<dyn Fn() -> BoxedResultFuture + Send + Sync>>,
   sink_factory: Option<Arc<dyn Fn(StreamInfo) -> Option<gstreamer::Element> + Send + Sync>>,
   presence: Vec<Element>,
   state: JitsiConferenceState,
@@ -278,6 +280,7 @@ impl JitsiConference {
         on_participant: None,
         on_participant_left: None,
         on_colibri_message: None,
+        on_conference_left: None,
         sink_factory: None,
         connected_tx: Some(tx),
       })),
@@ -601,6 +604,14 @@ impl JitsiConference {
   ) {
     self.inner.lock().await.on_colibri_message = Some(Arc::new(f));
   }
+
+  #[tracing::instrument(level = "trace", skip(f))]
+  pub async fn on_conference_left(
+    &self,
+    f: impl Fn() -> BoxedResultFuture + Send + Sync + 'static,
+  ) {
+    self.inner.lock().await.on_conference_left = Some(Arc::new(f));
+  }
 }
 
 #[async_trait]
@@ -732,7 +743,19 @@ impl StanzaFilter for JitsiConference {
                         Some(JingleSession::initiate(self, jingle).await?);
                     }
                     else {
-                      debug!("Ignored Jingle session-initiate from {}", from_jid);
+                      debug!("Declining P2P Jingle session-initiate from {}", from_jid);
+                      let result_iq = Iq::empty_result(from_jid.clone().into(), header.id.clone())
+                        .with_from(self.jid.clone().into());
+                      self.xmpp_tx.send(result_iq.into()).await?;
+                      let terminate = Jingle::new(Action::SessionTerminate, jingle.sid.clone())
+                        .set_reason(ReasonElement {
+                          reason: Reason::Decline,
+                          texts: std::collections::BTreeMap::new(),
+                        });
+                      let terminate_iq = Iq::from_set(generate_id(), terminate)
+                        .with_from(self.jid.clone().into())
+                        .with_to(from_jid.clone().into());
+                      self.xmpp_tx.send(terminate_iq.into()).await?;
                     }
                   }
                   else if jingle.action == Action::SourceAdd {
@@ -765,6 +788,12 @@ impl StanzaFilter for JitsiConference {
                       .as_mut()
                       .context("not connected (no jingle session)")?
                       .source_remove(jingle)?;
+                  }
+                  else {
+                    debug!("Acknowledging unhandled Jingle action {:?} from {}", jingle.action, from_jid);
+                    let result_iq = Iq::empty_result(from_jid.clone().into(), header.id.clone())
+                      .with_from(self.jid.clone().into());
+                    self.xmpp_tx.send(result_iq.into()).await?;
                   }
                 }
                 else {
@@ -990,6 +1019,8 @@ impl StanzaFilter for JitsiConference {
                       }));
                     }
 
+                    let mut closed_rx = colibri_channel.jvb_closed_receiver();
+
                     {
                       let self_ = self.clone();
                       tokio::spawn(async move {
@@ -1038,6 +1069,22 @@ impl StanzaFilter for JitsiConference {
                           }
                         }
                         Ok::<_, anyhow::Error>(())
+                      });
+                    }
+
+                    {
+                      let self_ = self.clone();
+                      tokio::spawn(async move {
+                        let jvb_closed = closed_rx.wait_for(|&closed| closed).await.is_ok();
+                        if jvb_closed {
+                          debug!("JVB closed Colibri session, firing on_conference_left");
+                          let maybe_f = self_.inner.lock().await.on_conference_left.take();
+                          if let Some(f) = maybe_f {
+                            if let Err(e) = f().await {
+                              warn!("on_conference_left failed: {:?}", e);
+                            }
+                          }
+                        }
                       });
                     }
                   }
