@@ -90,7 +90,10 @@ pub(super) fn build_decode_bin(
     let capsfilter = gstreamer::ElementFactory::make("capsfilter").build()?;
     capsfilter.set_property_from_str(
       "caps",
-      &format!("video/x-raw, width={}, height={}", recv_video_width, recv_video_height),
+      &format!(
+        "video/x-raw, width=(int)[1,{}], height=(int)[1,{}], pixel-aspect-ratio=1/1",
+        recv_video_width, recv_video_height
+      ),
     );
     decode_bin
       .add(&capsfilter)
