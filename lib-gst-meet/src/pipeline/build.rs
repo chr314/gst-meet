@@ -89,7 +89,7 @@ pub(super) fn connect_request_pt_map(
         }
       }
 
-      warn!("unknown payload type: {}", pt);
+      debug!("ignoring payload type {} (not negotiated)", pt);
       Ok(None)
     };
     match f() {
@@ -137,7 +137,7 @@ pub(super) fn connect_new_jitterbuffer(
           false
         },
         None => {
-          warn!("new-jitterbuffer for unknown ssrc {} — speculatively enabling RTX", ssrc);
+          debug!("new-jitterbuffer for unknown ssrc {} — speculatively enabling RTX", ssrc);
           true
         },
       };

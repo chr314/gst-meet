@@ -57,7 +57,7 @@ pub(super) fn build_decode_bin(
   let decoder = gstreamer::ElementFactory::make(codec.decoder_name()).build()?;
   if media_type.is_video() {
     decoder.set_property("automatic-request-sync-points", true);
-    decoder.set_property_from_str("automatic-request-sync-point-flags", "corrupt-output");
+    decoder.set_property_from_str("automatic-request-sync-point-flags", "corrupt-output+discard-input");
   }
 
   decode_bin
@@ -67,7 +67,17 @@ pub(super) fn build_decode_bin(
     .link(&decoder)
     .context("failed to link queue to decoder")?;
 
-  let post_decoder_queue = gstreamer::ElementFactory::make("queue").build()?;
+  let post_decoder_queue = {
+    let mut q = gstreamer::ElementFactory::make("queue");
+    if media_type.is_video() {
+      q = q
+        .property("max-size-buffers", 2u32)
+        .property("max-size-bytes", 0u32)
+        .property("max-size-time", 0u64)
+        .property_from_str("leaky", "downstream");
+    }
+    q.build()?
+  };
   decode_bin
     .add(&post_decoder_queue)
     .context("failed to add queue to decode bin")?;
@@ -110,7 +120,12 @@ pub(super) fn build_decode_bin(
       .link(&videoconvert)
       .context("failed to link capsfilter to videoconvert")?;
 
-    let post_videoconvert_queue = gstreamer::ElementFactory::make("queue").build()?;
+    let post_videoconvert_queue = gstreamer::ElementFactory::make("queue")
+      .property("max-size-buffers", 2u32)
+      .property("max-size-bytes", 0u32)
+      .property("max-size-time", 0u64)
+      .property_from_str("leaky", "downstream")
+      .build()?;
     decode_bin
       .add(&post_videoconvert_queue)
       .context("failed to add queue to decode bin")?;
