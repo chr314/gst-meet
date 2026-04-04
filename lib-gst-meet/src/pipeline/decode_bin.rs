@@ -57,7 +57,8 @@ pub(super) fn build_decode_bin(
   let decoder = gstreamer::ElementFactory::make(codec.decoder_name()).build()?;
   if media_type.is_video() {
     decoder.set_property("automatic-request-sync-points", true);
-    decoder.set_property_from_str("automatic-request-sync-point-flags", "corrupt-output+discard-input");
+    decoder.set_property_from_str("automatic-request-sync-point-flags", "corrupt-output");
+    decoder.set_property("min-force-key-unit-interval", 2_000_000_000u64);
   }
 
   decode_bin
