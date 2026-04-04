@@ -97,12 +97,10 @@ pub(super) fn connect_request_pt_map(
         debug!("mapped pt to caps: {:?}", caps);
         Some(caps.to_value())
       },
-      // Return empty caps for unknown PTs — glib 0.22 panics if the signal
-      // callback returns None for a non-nullable return type.
-      Ok(None) => Some(gstreamer::Caps::new_empty().to_value()),
+      Ok(None) => Some(gstreamer::Caps::new_any().to_value()),
       Err(e) => {
         error!("handling request-pt-map: {:?}", e);
-        Some(gstreamer::Caps::new_empty().to_value())
+        Some(gstreamer::Caps::new_any().to_value())
       },
     }
   });
