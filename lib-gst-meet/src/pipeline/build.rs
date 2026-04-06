@@ -4,15 +4,14 @@ use std::{
 };
 
 use anyhow::{Context, Result};
-use glib::prelude::{Cast as _, ToValue as _};
+use glib::prelude::ToValue as _;
 use gstreamer::prelude::{ElementExt as _, GstBinExt as _, GstObjectExt as _, ObjectExt as _};
 use tokio::sync::oneshot;
 use tracing::{debug, error, warn};
 
-use super::{
-  codec::{Codec, RTP_HDREXT_SSRC_AUDIO_LEVEL, RTP_HDREXT_TRANSPORT_CC},
-  decode::SsrcState,
-};
+use crate::source::Source;
+
+use super::codec::{Codec, RTP_HDREXT_SSRC_AUDIO_LEVEL, RTP_HDREXT_TRANSPORT_CC};
 
 pub(crate) struct PipelineBuildConfig {
   pub(crate) codecs: Vec<Codec>,
@@ -65,8 +64,7 @@ pub(super) fn connect_request_pt_map(
             if let Some(hdrext) = audio_hdrext_transport_cc {
               caps = caps.field(&format!("extmap-{}", hdrext), RTP_HDREXT_TRANSPORT_CC);
             }
-          }
-          else {
+          } else {
             caps = caps
               .field("media", "video")
               .field("clock-rate", 90000)
@@ -78,8 +76,7 @@ pub(super) fn connect_request_pt_map(
             }
           }
           return Ok::<_, anyhow::Error>(Some(caps.build()));
-        }
-        else if codec.is_rtx(pt) {
+        } else if codec.is_rtx(pt) {
           caps = caps
             .field("media", "video")
             .field("clock-rate", 90000)
@@ -109,35 +106,33 @@ pub(super) fn connect_request_pt_map(
 /// Connects the `new-jitterbuffer` signal that enables retransmission and configures latency.
 pub(super) fn connect_new_jitterbuffer(
   rtpbin: &gstreamer::Element,
-  ssrc_registry: &Arc<Mutex<HashMap<u32, SsrcState>>>,
+  source_registry: &Arc<Mutex<HashMap<u32, Source>>>,
   buffer_size: u32,
 ) {
-  let ssrc_registry = ssrc_registry.clone();
+  let source_registry = source_registry.clone();
   rtpbin.connect("new-jitterbuffer", false, move |values| {
-    let ssrc_registry = ssrc_registry.clone();
+    let source_registry = source_registry.clone();
     let f = move || {
       let rtpjitterbuffer: gstreamer::Element = values[1].get()?;
       let session: u32 = values[2].get()?;
       let ssrc: u32 = values[3].get()?;
       debug!("new jitterbuffer created for session {} ssrc {}", session, ssrc);
 
-      let enable_rtx = match ssrc_registry
+      let enable_rtx = match source_registry
         .lock()
-        .map_err(|e| anyhow::anyhow!("ssrc_registry lock poisoned: {}", e))?
+        .map_err(|e| anyhow::anyhow!("source_registry lock poisoned: {}", e))?
         .get(&ssrc)
       {
-        Some(SsrcState::Signaled { media_type, participant_id }) => {
-          media_type.is_video() && participant_id.is_some()
-        },
-        Some(SsrcState::Active { media_type, participant_id, .. }) => {
-          media_type.is_video() && !participant_id.is_empty()
-        },
-        Some(SsrcState::Pending { .. }) => {
-          warn!("new-jitterbuffer for pending ssrc {} (no media type known yet)", ssrc);
-          false
-        },
+        Some(Source {
+          media_type,
+          participant_id,
+          ..
+        }) => media_type.is_video() && participant_id.is_some(),
         None => {
-          debug!("new-jitterbuffer for unknown ssrc {} — speculatively enabling RTX", ssrc);
+          debug!(
+            "new-jitterbuffer for unknown ssrc {} — speculatively enabling RTX",
+            ssrc
+          );
           true
         },
       };

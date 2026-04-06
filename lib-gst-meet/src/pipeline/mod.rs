@@ -36,13 +36,14 @@ pub(crate) use build::PipelineBuildConfig;
 pub(crate) use codec::{Codec, CodecName, ParsedRtpDescription};
 pub(crate) use ice::participant_id_for_owner;
 
-use decode::SsrcState;
+use decode::{PadKey, PadState};
 
 pub(crate) struct MediaPipeline {
   pipeline: gstreamer::Pipeline,
   audio_sink_element: gstreamer::Element,
   video_sink_element: gstreamer::Element,
-  ssrc_registry: Arc<Mutex<HashMap<u32, SsrcState>>>,
+  source_registry: Arc<Mutex<HashMap<u32, Source>>>,
+  pad_registry: Arc<Mutex<HashMap<PadKey, PadState>>>,
   conference: JitsiConference,
   codecs: Vec<Codec>,
   ice_agent: nice::Agent,
@@ -108,29 +109,8 @@ impl MediaPipeline {
   }
 
   pub(crate) fn remote_ssrc_snapshot(&self) -> HashMap<u32, Source> {
-    match self.ssrc_registry.lock() {
-      Ok(g) => g
-        .iter()
-        .filter_map(|(ssrc, state)| match state {
-          SsrcState::Signaled { participant_id, media_type } => Some((
-            *ssrc,
-            Source {
-              ssrc: *ssrc,
-              participant_id: participant_id.clone(),
-              media_type: *media_type,
-            },
-          )),
-          SsrcState::Active { participant_id, media_type, .. } => Some((
-            *ssrc,
-            Source {
-              ssrc: *ssrc,
-              participant_id: Some(participant_id.clone()),
-              media_type: *media_type,
-            },
-          )),
-          SsrcState::Pending { .. } => None,
-        })
-        .collect(),
+    match self.source_registry.lock() {
+      Ok(g) => g.clone(),
       Err(_) => HashMap::new(),
     }
   }
@@ -173,16 +153,8 @@ impl MediaPipeline {
       .flat_map(|codec| codec.rtx_pt.map(|rtx_pt| (codec.pt.to_string(), rtx_pt as u32)))
       .collect();
 
-    let initial_registry: HashMap<u32, SsrcState> = remote_ssrc_map
-      .into_iter()
-      .map(|(ssrc, source)| {
-        (ssrc, SsrcState::Signaled {
-          participant_id: source.participant_id,
-          media_type: source.media_type,
-        })
-      })
-      .collect();
-    let ssrc_registry = Arc::new(Mutex::new(initial_registry));
+    let source_registry = Arc::new(Mutex::new(remote_ssrc_map));
+    let pad_registry = Arc::new(Mutex::new(HashMap::new()));
 
     build::connect_request_pt_map(
       &rtpbin,
@@ -191,11 +163,11 @@ impl MediaPipeline {
       audio_hdrext_transport_cc,
       video_hdrext_transport_cc,
     );
-    build::connect_new_jitterbuffer(&rtpbin, &ssrc_registry, conference.config.buffer_size);
+    build::connect_new_jitterbuffer(&rtpbin, &source_registry, conference.config.buffer_size);
     build::connect_request_aux(&rtpbin, pts, video_ssrc, video_rtx_ssrc);
 
-    decode::connect_pad_added(&rtpbin, &pipeline, conference, &codecs, &ssrc_registry);
-    decode::connect_pad_removed(&rtpbin, &pipeline, conference, &ssrc_registry);
+    decode::connect_pad_added(&rtpbin, &pipeline, conference, &codecs, &source_registry, &pad_registry);
+    decode::connect_pad_removed(&rtpbin, &pipeline, conference, &pad_registry);
 
     let (audio_sink_element, video_sink_element, rtpfunnel) =
       send::build_send_path(&pipeline, &codecs, audio_ssrc, video_ssrc, conference)?;
@@ -226,7 +198,8 @@ impl MediaPipeline {
       pipeline,
       audio_sink_element,
       video_sink_element,
-      ssrc_registry,
+      source_registry,
+      pad_registry,
       conference: conference.clone(),
       codecs,
       ice_agent,
@@ -244,80 +217,109 @@ impl MediaPipeline {
           let participant_id = participant_id_for_owner(owner)?;
           let media_type = MediaType::classify(&description.media, ssrc.video_type.as_deref());
           let ssrc_id = ssrc.id;
+          let source = Source {
+            ssrc: ssrc_id,
+            participant_id: participant_id.clone(),
+            media_type,
+          };
 
           debug!(
             "source-add: ssrc {} participant_id={:?} media_type={:?}",
             ssrc_id, participant_id, media_type
           );
 
-          let upgrade = {
-            let mut registry = self
-              .ssrc_registry
+          self
+            .source_registry
+            .lock()
+            .map_err(|e| anyhow::anyhow!("source_registry lock poisoned: {}", e))?
+            .insert(ssrc_id, source);
+
+          if let Some(pid) = participant_id {
+            let mut pad_keys: Vec<_> = self
+              .pad_registry
               .lock()
-              .map_err(|e| anyhow::anyhow!("ssrc_registry lock poisoned: {}", e))?;
+              .map_err(|e| anyhow::anyhow!("pad_registry lock poisoned: {}", e))?
+              .iter()
+              .filter_map(|(pad_key, state)| match state {
+                PadState::Parked {
+                  participant_id: None,
+                  media_type: parked_media_type,
+                  ..
+                } if pad_key.ssrc == ssrc_id
+                  && parked_media_type
+                    .map(|parked_media_type| parked_media_type == media_type)
+                    .unwrap_or(true) =>
+                {
+                  Some(*pad_key)
+                },
+                _ => None,
+              })
+              .collect();
+            pad_keys.sort_by_key(|pad_key| (pad_key.session, pad_key.pt));
 
-            match registry.get(&ssrc_id) {
-              Some(SsrcState::Pending { .. }) if participant_id.is_some() => {
-                let state = registry.remove(&ssrc_id).unwrap();
-                if let SsrcState::Pending { rtpbin_pad, pt, fakesink } = state {
-                  Some((rtpbin_pad, pt, fakesink))
-                }
-                else {
-                  unreachable!()
-                }
-              },
-              _ => {
-                registry.insert(ssrc_id, SsrcState::Signaled { participant_id: participant_id.clone(), media_type });
-                None
-              },
-            }
-          }; // registry lock dropped
-
-          if let (Some(pid), Some((rtpbin_pad, pt, old_fakesink))) = (participant_id, upgrade) {
-            if let Some(sink_pad) = old_fakesink.static_pad("sink") {
-              let _ = rtpbin_pad.unlink(&sink_pad);
-            }
-            let _ = old_fakesink.set_state(gstreamer::State::Null);
-            let _ = self.pipeline.remove(&old_fakesink);
-
-            {
-              let mut registry = self
-                .ssrc_registry
-                .lock()
-                .map_err(|e| anyhow::anyhow!("ssrc_registry lock poisoned: {}", e))?;
-              decode::park_old_active(&mut registry, &self.pipeline, &pid, media_type, ssrc_id);
-            }
-
-            let new_state = match decode::activate_ssrc(
-              &self.pipeline,
-              &self.conference,
-              &self.codecs,
-              ssrc_id,
-              pt,
-              media_type,
-              &pid,
-              &rtpbin_pad,
-            )
-            .await
-            {
-              Ok(state) => state,
-              Err(e) => {
-                warn!("source-add: failed to activate ssrc {}: {:?} — re-parking as Pending", ssrc_id, e);
-                match decode::make_fakesink(&self.pipeline, &rtpbin_pad) {
-                  Ok(fakesink) => decode::SsrcState::Pending { rtpbin_pad: rtpbin_pad.clone(), pt, fakesink },
-                  Err(e2) => {
-                    warn!("source-add: cannot create fallback fakesink for ssrc {}: {:?}", ssrc_id, e2);
-                    continue;
+            for pad_key in pad_keys {
+              let parked = {
+                let mut registry = self
+                  .pad_registry
+                  .lock()
+                  .map_err(|e| anyhow::anyhow!("pad_registry lock poisoned: {}", e))?;
+                match registry.remove(&pad_key) {
+                  Some(PadState::Parked {
+                    rtpbin_pad, fakesink, ..
+                  }) => Some((rtpbin_pad, fakesink)),
+                  Some(state) => {
+                    registry.insert(pad_key, state);
+                    None
                   },
+                  None => None,
                 }
-              },
-            };
+              };
+              let Some((rtpbin_pad, old_fakesink)) = parked else {
+                continue;
+              };
 
-            let mut registry = self
-              .ssrc_registry
-              .lock()
-              .map_err(|e| anyhow::anyhow!("ssrc_registry lock poisoned: {}", e))?;
-            registry.insert(ssrc_id, new_state);
+              if let Some(sink_pad) = old_fakesink.static_pad("sink") {
+                let _ = rtpbin_pad.unlink(&sink_pad);
+              }
+              let _ = old_fakesink.set_state(gstreamer::State::Null);
+              let _ = self.pipeline.remove(&old_fakesink);
+
+              let new_state = match decode::activate_pad(
+                &self.pipeline,
+                &self.conference,
+                &self.codecs,
+                pad_key,
+                media_type,
+                &pid,
+                &rtpbin_pad,
+              )
+              .await
+              {
+                Ok(state) => state,
+                Err(e) => {
+                  warn!("source-add: failed to activate pad {:?}: {:?} — re-parking", pad_key, e);
+                  match decode::park_pad(&self.pipeline, &rtpbin_pad, Some(pid.clone()), Some(media_type)) {
+                    Ok(state) => state,
+                    Err(e2) => {
+                      warn!(
+                        "source-add: cannot create fallback fakesink for pad {:?}: {:?}",
+                        pad_key, e2
+                      );
+                      continue;
+                    },
+                  }
+                },
+              };
+
+              let mut registry = self
+                .pad_registry
+                .lock()
+                .map_err(|e| anyhow::anyhow!("pad_registry lock poisoned: {}", e))?;
+              if matches!(new_state, PadState::Active { .. }) {
+                decode::park_old_active(&mut registry, &self.pipeline, &pid, media_type, pad_key);
+              }
+              registry.insert(pad_key, new_state);
+            }
           }
         }
       }
@@ -330,13 +332,19 @@ impl MediaPipeline {
       if let Some(Description::Rtp(description)) = &content.description {
         for ssrc in &description.ssrcs {
           debug!("source-remove: ssrc {}", ssrc.id);
-          let state = self
-            .ssrc_registry
+          let _ = self
+            .source_registry
             .lock()
-            .map_err(|e| anyhow::anyhow!("ssrc_registry lock poisoned: {}", e))?
+            .map_err(|e| anyhow::anyhow!("source_registry lock poisoned: {}", e))?
             .remove(&ssrc.id);
-          if let Some(state) = state {
-            if let SsrcState::Active {
+          let to_remove: Vec<(PadKey, PadState)> = self
+            .pad_registry
+            .lock()
+            .map_err(|e| anyhow::anyhow!("pad_registry lock poisoned: {}", e))?
+            .extract_if(|pad_key, _| pad_key.ssrc == ssrc.id)
+            .collect();
+          for (pad_key, state) in to_remove {
+            if let PadState::Active {
               ref participant_id,
               media_type,
               ..
@@ -345,7 +353,7 @@ impl MediaPipeline {
               let conference = self.conference.clone();
               let event = crate::conference::StreamEvent {
                 participant_id: participant_id.clone(),
-                ssrc: ssrc.id,
+                ssrc: pad_key.ssrc,
                 media_type,
                 kind: crate::conference::StreamEventKind::Removed,
               };
@@ -353,7 +361,7 @@ impl MediaPipeline {
                 conference.fire_stream_event(event).await;
               });
             }
-            decode::cleanup_ssrc(&self.pipeline, state, ssrc.id);
+            decode::cleanup_pad(&self.pipeline, state, pad_key);
           }
         }
       }
@@ -362,31 +370,56 @@ impl MediaPipeline {
   }
 
   pub(crate) fn remove_participant(&self, participant_id: &str) {
-    let to_remove: Vec<(u32, SsrcState)> = match self.ssrc_registry.lock() {
+    let _ = match self.source_registry.lock() {
       Ok(mut g) => {
         let ssrcs: Vec<u32> = g
           .iter()
-          .filter(|(_, state)| match state {
-            SsrcState::Signaled { participant_id: Some(pid), .. } => pid == participant_id,
-            SsrcState::Active { participant_id: pid, .. } => pid == participant_id,
-            _ => false,
+          .filter(|(_, source)| match &source.participant_id {
+            Some(pid) => pid == participant_id,
+            None => false,
           })
           .map(|(ssrc, _)| *ssrc)
           .collect();
-        ssrcs.into_iter().filter_map(|ssrc| g.remove(&ssrc).map(|s| (ssrc, s))).collect()
+        for ssrc in ssrcs {
+          g.remove(&ssrc);
+        }
       },
       Err(e) => {
-        warn!("ssrc_registry lock poisoned in remove_participant: {:?}", e);
+        warn!("source_registry lock poisoned in remove_participant: {:?}", e);
         return;
       },
     };
 
-    for (ssrc, state) in to_remove {
-      if let SsrcState::Active { participant_id: ref pid, media_type, .. } = state {
+    let to_remove: Vec<(PadKey, PadState)> = match self.pad_registry.lock() {
+      Ok(mut g) => g
+        .extract_if(|_, state| match state {
+          PadState::Parked {
+            participant_id: Some(pid),
+            ..
+          } => pid == participant_id,
+          PadState::Active {
+            participant_id: pid, ..
+          } => pid == participant_id,
+          _ => false,
+        })
+        .collect(),
+      Err(e) => {
+        warn!("pad_registry lock poisoned in remove_participant: {:?}", e);
+        return;
+      },
+    };
+
+    for (pad_key, state) in to_remove {
+      if let PadState::Active {
+        participant_id: ref pid,
+        media_type,
+        ..
+      } = state
+      {
         let conference = self.conference.clone();
         let event = crate::conference::StreamEvent {
           participant_id: pid.clone(),
-          ssrc,
+          ssrc: pad_key.ssrc,
           media_type,
           kind: crate::conference::StreamEventKind::Removed,
         };
@@ -394,13 +427,10 @@ impl MediaPipeline {
           conference.fire_stream_event(event).await;
         });
       }
-      decode::cleanup_ssrc(&self.pipeline, state, ssrc);
+      decode::cleanup_pad(&self.pipeline, state, pad_key);
     }
 
-    if let Some(bin) = self
-      .pipeline
-      .by_name(&format!("participant_{}", participant_id))
-    {
+    if let Some(bin) = self.pipeline.by_name(&format!("participant_{}", participant_id)) {
       debug!("removing participant bin for {}", participant_id);
       if let Err(e) = bin.set_state(gstreamer::State::Null) {
         warn!("failed to set participant bin state to Null: {:?}", e);

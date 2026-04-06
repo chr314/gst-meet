@@ -72,7 +72,7 @@ pub(super) fn build_decode_bin(
     let mut q = gstreamer::ElementFactory::make("queue");
     if media_type.is_video() {
       q = q
-        .property("max-size-buffers", 2u32)
+        .property("max-size-buffers", 10u32)
         .property("max-size-bytes", 0u32)
         .property("max-size-time", 0u64)
         .property_from_str("leaky", "downstream");
@@ -122,7 +122,7 @@ pub(super) fn build_decode_bin(
       .context("failed to link capsfilter to videoconvert")?;
 
     let post_videoconvert_queue = gstreamer::ElementFactory::make("queue")
-      .property("max-size-buffers", 2u32)
+      .property("max-size-buffers", 10u32)
       .property("max-size-bytes", 0u32)
       .property("max-size-time", 0u64)
       .property_from_str("leaky", "downstream")

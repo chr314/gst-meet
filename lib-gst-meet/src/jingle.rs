@@ -32,8 +32,7 @@ use crate::{
 };
 
 const RTP_HDREXT_SSRC_AUDIO_LEVEL: &str = "urn:ietf:params:rtp-hdrext:ssrc-audio-level";
-const RTP_HDREXT_TRANSPORT_CC: &str =
-  "http://www.ietf.org/id/draft-holmer-rmcat-transport-wide-cc-extensions-01";
+const RTP_HDREXT_TRANSPORT_CC: &str = "http://www.ietf.org/id/draft-holmer-rmcat-transport-wide-cc-extensions-01";
 
 pub(crate) struct JingleSession {
   pub(crate) media_pipeline: MediaPipeline,
@@ -89,16 +88,11 @@ impl JingleSession {
 
     for content in &jingle.contents {
       if let Some(Description::Rtp(description)) = &content.description {
-        if let Some(description) =
-          MediaPipeline::parse_rtp_description(description, &mut remote_ssrc_map)?
-        {
+        if let Some(description) = MediaPipeline::parse_rtp_description(description, &mut remote_ssrc_map)? {
           codecs.extend(description.codecs);
-          audio_hdrext_ssrc_audio_level =
-            audio_hdrext_ssrc_audio_level.or(description.audio_hdrext_ssrc_audio_level);
-          audio_hdrext_transport_cc =
-            audio_hdrext_transport_cc.or(description.audio_hdrext_transport_cc);
-          video_hdrext_transport_cc =
-            video_hdrext_transport_cc.or(description.video_hdrext_transport_cc);
+          audio_hdrext_ssrc_audio_level = audio_hdrext_ssrc_audio_level.or(description.audio_hdrext_ssrc_audio_level);
+          audio_hdrext_transport_cc = audio_hdrext_transport_cc.or(description.audio_hdrext_transport_cc);
+          video_hdrext_transport_cc = video_hdrext_transport_cc.or(description.video_hdrext_transport_cc);
         }
       }
 
@@ -112,16 +106,34 @@ impl JingleSession {
       }
     }
 
-    // Keep only audio codecs + video codecs that match the configured preference.
-    // This ensures request-pt-map never advertises support for unwanted codecs (e.g. AV1
-    // sent by JVB for screenshare even when not in video_codecs).
     codecs.retain(|codec| {
-      codec.is_audio()
-        || conference
-          .config
-          .video_codecs
-          .iter()
-          .any(|name| codec.is_codec(name.as_str()))
+      if codec.is_audio() {
+        return true;
+      }
+
+      let configured = conference
+        .config
+        .video_codecs
+        .iter()
+        .any(|name| codec.is_codec(name.as_str()));
+      if !configured {
+        debug!("dropping unconfigured receive codec {}", codec.encoding_name());
+        return false;
+      }
+
+      let depay_supported = gstreamer::ElementFactory::find(codec.depayloader_name()).is_some();
+      let decoder_supported = gstreamer::ElementFactory::find(codec.decoder_name()).is_some();
+      if !depay_supported || !decoder_supported {
+        warn!(
+          "dropping receive codec {} because local GStreamer support is incomplete (depayloader={}, decoder={})",
+          codec.encoding_name(),
+          depay_supported,
+          decoder_supported
+        );
+        return false;
+      }
+
+      true
     });
 
     let ice_transport = ice_transport.context("missing ICE transport")?;
@@ -137,8 +149,7 @@ impl JingleSession {
     let mut dtls_cert_params = rcgen::CertificateParams::new(vec!["gst-meet".to_owned()])?;
     let dtls_cert = dtls_cert_params.self_signed(&dtls_key_pair)?;
     let fingerprint: Vec<u8> = Sha256::digest(dtls_cert.der()).to_vec();
-    let fingerprint_str =
-      itertools::join(fingerprint.iter().map(|byte| format!("{:X}", byte)), ":");
+    let fingerprint_str = itertools::join(fingerprint.iter().map(|byte| format!("{:X}", byte)), ":");
     let dtls_cert_pem = dtls_cert.pem();
     let dtls_private_key_pem = dtls_key_pair.serialize_pem();
     debug!("Local DTLS certificate:\n{}", dtls_cert_pem);
@@ -196,14 +207,15 @@ impl JingleSession {
           let mut pt = PayloadType::new(codec.pt, "opus".to_owned(), 48000, 2);
           pt.rtcp_fbs = codec.rtcp_fbs.clone();
           vec![pt]
-        }
-        else {
+        } else {
           bail!("no opus payload type in jingle session-initiate");
         }
-      }
-      else {
+      } else {
         let mut pts = vec![];
-        let codec = conference.config.video_codecs.iter()
+        let codec = conference
+          .config
+          .video_codecs
+          .iter()
           .find_map(|name| codecs.iter().find(|codec| codec.is_codec(name.as_str())));
         if let Some(codec) = codec {
           let mut pt = PayloadType::new(codec.pt, codec.encoding_name().to_owned(), 90000, 1);
@@ -223,8 +235,7 @@ impl JingleSession {
               .collect();
             pts.push(rtx_pt);
           }
-        }
-        else {
+        } else {
           bail!("unsupported video codec(s): {:?}", conference.config.video_codecs);
         }
         pts
@@ -239,8 +250,7 @@ impl JingleSession {
 
       description.ssrc = Some(if initiate_content.name.0 == "audio" {
         audio_ssrc.to_string()
-      }
-      else {
+      } else {
         video_ssrc.to_string()
       });
 
@@ -250,8 +260,7 @@ impl JingleSession {
           Some(format!("{endpoint_id}-a0")),
           None,
         )]
-      }
-      else {
+      } else {
         let source_name = format!("{endpoint_id}-v0");
         vec![
           jingle_ssma::Source::new(video_ssrc, Some(source_name.clone()), Some("camera".into())),
@@ -268,8 +277,7 @@ impl JingleSession {
 
       description.ssrc_groups = if initiate_content.name.0 == "audio" {
         vec![]
-      }
-      else {
+      } else {
         vec![jingle_ssma::Group {
           semantics: Semantics::Fid,
           sources: vec![
@@ -281,18 +289,16 @@ impl JingleSession {
 
       if initiate_content.name.0 == "audio" {
         if let Some(hdrext) = audio_hdrext_ssrc_audio_level {
-          description.hdrexts.push(RtpHdrext::new(
-            hdrext,
-            RTP_HDREXT_SSRC_AUDIO_LEVEL.to_owned(),
-          ));
+          description
+            .hdrexts
+            .push(RtpHdrext::new(hdrext, RTP_HDREXT_SSRC_AUDIO_LEVEL.to_owned()));
         }
         if let Some(hdrext) = audio_hdrext_transport_cc {
           description
             .hdrexts
             .push(RtpHdrext::new(hdrext, RTP_HDREXT_TRANSPORT_CC.to_owned()));
         }
-      }
-      else if initiate_content.name.0 == "video" {
+      } else if initiate_content.name.0 == "video" {
         if let Some(hdrext) = video_hdrext_transport_cc {
           description
             .hdrexts
@@ -313,36 +319,26 @@ impl JingleSession {
           continue;
         };
         let foundation = c.foundation()?;
-        transport
-          .candidates
-          .push(xmpp_parsers::jingle_ice_udp::Candidate {
-            component: c.component_id() as u8,
-            foundation: foundation.to_owned(),
-            generation: 0,
-            id: Uuid::new_v4().to_string(),
-            ip: addr.ip(),
-            port: addr.port(),
-            priority: c.priority(),
-            protocol: "udp".to_owned(),
-            type_: match c.type_() {
-              nice_gst_meet::CandidateType::Host => {
-                xmpp_parsers::jingle_ice_udp::Type::Host
-              },
-              nice_gst_meet::CandidateType::PeerReflexive => {
-                xmpp_parsers::jingle_ice_udp::Type::Prflx
-              },
-              nice_gst_meet::CandidateType::ServerReflexive => {
-                xmpp_parsers::jingle_ice_udp::Type::Srflx
-              },
-              nice_gst_meet::CandidateType::Relayed => {
-                xmpp_parsers::jingle_ice_udp::Type::Relay
-              },
-              other => bail!("unsupported candidate type: {:?}", other),
-            },
-            rel_addr: None,
-            rel_port: None,
-            network: None,
-          });
+        transport.candidates.push(xmpp_parsers::jingle_ice_udp::Candidate {
+          component: c.component_id() as u8,
+          foundation: foundation.to_owned(),
+          generation: 0,
+          id: Uuid::new_v4().to_string(),
+          ip: addr.ip(),
+          port: addr.port(),
+          priority: c.priority(),
+          protocol: "udp".to_owned(),
+          type_: match c.type_() {
+            nice_gst_meet::CandidateType::Host => xmpp_parsers::jingle_ice_udp::Type::Host,
+            nice_gst_meet::CandidateType::PeerReflexive => xmpp_parsers::jingle_ice_udp::Type::Prflx,
+            nice_gst_meet::CandidateType::ServerReflexive => xmpp_parsers::jingle_ice_udp::Type::Srflx,
+            nice_gst_meet::CandidateType::Relayed => xmpp_parsers::jingle_ice_udp::Type::Relay,
+            other => bail!("unsupported candidate type: {:?}", other),
+          },
+          rel_addr: None,
+          rel_port: None,
+          network: None,
+        });
       }
 
       jingle_accept = jingle_accept.add_content(
