@@ -74,8 +74,8 @@ impl Candidate {
         if family == libc::AF_INET {
           Some(
             SocketAddrV4::new(
-              self.inner.addr.s.ip4.sin_addr.s_addr.into(),
-              self.inner.addr.s.ip4.sin_port,
+              u32::from_be(self.inner.addr.s.ip4.sin_addr.s_addr).into(),
+              u16::from_be(self.inner.addr.s.ip4.sin_port),
             )
             .into(),
           )
@@ -84,7 +84,7 @@ impl Candidate {
           Some(
             SocketAddrV6::new(
               self.inner.addr.s.ip6.sin6_addr.s6_addr.into(),
-              self.inner.addr.s.ip6.sin6_port,
+              u16::from_be(self.inner.addr.s.ip6.sin6_port),
               self.inner.addr.s.ip6.sin6_flowinfo,
               self.inner.addr.s.ip6.sin6_scope_id,
             )
@@ -102,8 +102,8 @@ impl Candidate {
         if family == AF_INET {
           Some(
             SocketAddrV4::new(
-              self.inner.addr.s.ip4.sin_addr.S_un.S_addr.into(),
-              self.inner.addr.s.ip4.sin_port,
+              u32::from_be(self.inner.addr.s.ip4.sin_addr.S_un.S_addr).into(),
+              u16::from_be(self.inner.addr.s.ip4.sin_port),
             )
             .into(),
           )
@@ -112,7 +112,7 @@ impl Candidate {
           Some(
             SocketAddrV6::new(
               self.inner.addr.s.ip6.sin6_addr.u.Byte.into(),
-              self.inner.addr.s.ip6.sin6_port,
+              u16::from_be(self.inner.addr.s.ip6.sin6_port),
               self.inner.addr.s.ip6.sin6_flowinfo,
               self.inner.addr.s.ip6.Anonymous.sin6_scope_id,
             )

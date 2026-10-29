@@ -29,14 +29,11 @@ impl IqGetPayload for ServicesQuery {}
 #[derive(Debug, Clone)]
 pub struct Service {
   pub(crate) r#type: String,
-  pub(crate) name: Option<String>,
   pub(crate) host: String,
   pub(crate) port: Option<u16>,
   pub(crate) transport: Option<String>,
-  pub(crate) restricted: Option<bool>,
   pub(crate) username: Option<String>,
   pub(crate) password: Option<String>,
-  pub(crate) expires: Option<String>,
 }
 
 #[derive(Debug)]
@@ -57,19 +54,43 @@ impl TryFrom<Element> for ServicesResult {
         .map(|child| {
           Ok(Service {
             r#type: child.attr("type").context("missing type attr")?.to_owned(),
-            name: child.attr("name").map(ToOwned::to_owned),
             host: child.attr("host").context("missing host attr")?.to_owned(),
             port: child.attr("port").map(|p| p.parse()).transpose()?,
             transport: child.attr("transport").map(ToOwned::to_owned),
-            restricted: child
-              .attr("restricted")
-              .map(|b| b.to_lowercase() == "parse" || b == "1"),
             username: child.attr("username").map(ToOwned::to_owned),
             password: child.attr("password").map(ToOwned::to_owned),
-            expires: child.attr("expires").map(ToOwned::to_owned),
           })
         })
         .collect::<Result<_>>()?,
     })
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  #[test]
+  fn parses_the_services_of_a_deployment() {
+    let elem: Element = "<services xmlns='urn:xmpp:extdisco:2'>\
+        <service type='stun' host='meet-jit-si-turnrelay.jitsi.net' port='443' restricted='false'/>\
+        <service type='turns' host='turn.example' port='443' transport='tcp' username='u' password='p' restricted='true' expires='2026-01-01T00:00:00Z'/>\
+      </services>"
+      .parse()
+      .unwrap();
+    let services = ServicesResult::try_from(elem).unwrap().services;
+    assert_eq!(services.len(), 2);
+    assert_eq!(services[0].r#type, "stun");
+    assert_eq!(services[0].port, Some(443));
+    assert_eq!(services[1].transport.as_deref(), Some("tcp"));
+    assert_eq!(services[1].username.as_deref(), Some("u"));
+  }
+
+  #[test]
+  fn rejects_a_service_without_a_host() {
+    let elem: Element = "<services xmlns='urn:xmpp:extdisco:2'><service type='stun'/></services>"
+      .parse()
+      .unwrap();
+    assert!(ServicesResult::try_from(elem).is_err());
   }
 }

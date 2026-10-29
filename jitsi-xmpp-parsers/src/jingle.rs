@@ -209,6 +209,7 @@ impl From<Jingle> for Element {
       .append_all(jingle.contents)
       .append_all(jingle.reason.map(Element::from))
       .append_all(jingle.group.map(Element::from))
+      .append_all(jingle.other)
       .build()
   }
 }
@@ -386,5 +387,26 @@ impl Content {
   pub fn with_security(mut self, security: Element) -> Content {
     self.security = Some(security);
     self
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  #[test]
+  fn other_children_are_serialized() {
+    let mut jingle = Jingle::new(Action::SessionInfo, SessionId("sid".to_owned()));
+    jingle.other = vec![
+      Element::builder("ice-state", "http://jitsi.org/protocol/focus")
+        .append("failed")
+        .build(),
+      Element::builder("bridge-session", "http://jitsi.org/protocol/focus")
+        .attr(::minidom::rxml::xml_ncname!("id").to_owned(), "bs-1")
+        .build(),
+    ];
+    let element = Element::from(jingle.clone());
+    assert_eq!(element.children().count(), 2);
+    assert_eq!(Jingle::try_from(element).unwrap(), jingle);
   }
 }

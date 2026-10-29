@@ -1,3 +1,7 @@
+// The contract of these functions is the C interface in `include/`: a pointer is one the matching `gstmeet_*` function
+// returned, or a string the caller owns.
+#![allow(clippy::missing_safety_doc)]
+
 use std::{
   ffi::{c_void, CStr, CString},
   os::raw::c_char,
@@ -11,7 +15,8 @@ use std::{
 use anyhow::Result;
 use glib::{
   ffi::GMainContext,
-  translate::{from_glib, from_glib_full, ToGlibPtr},
+  translate::{from_glib, from_glib_none, ToGlibPtr},
+  MainContext,
 };
 use lib_gst_meet::JitsiConferenceConfig;
 pub use lib_gst_meet::{init_tracing, Authentication, Connection, JitsiConference, MediaType};
@@ -150,6 +155,13 @@ pub unsafe extern "C" fn gstmeet_connection_join_conference(
         .to_string(),
     )
   };
+  // The caller iterates the context; libnice runs on it. Without one, the library makes its own.
+  let glib_main_context: Option<MainContext> = if glib_main_context.is_null() {
+    None
+  }
+  else {
+    Some(from_glib_none(glib_main_context))
+  };
   let config = {
     #[allow(unused_mut, unused_variables)]
     let mut b = JitsiConferenceConfig::builder()
@@ -159,7 +171,8 @@ pub unsafe extern "C" fn gstmeet_connection_join_conference(
       .video_codecs(vec![CStr::from_ptr((*config).video_codec)
         .to_string_lossy()
         .to_string()])
-      .maybe_region(region);
+      .maybe_region(region)
+      .maybe_glib_main_context(glib_main_context);
 
     #[cfg(feature = "log-rtp")]
     let b = b.log_rtp(false).log_rtcp(false);
@@ -203,12 +216,8 @@ pub unsafe extern "C" fn gstmeet_conference_pipeline(
   context: *mut Context,
   conference: *mut JitsiConference,
 ) -> *mut gstreamer::ffi::GstPipeline {
-  (*context)
-    .runtime
-    .block_on((*conference).pipeline())
-    .map(|pipeline| pipeline.to_glib_full())
-    .map_err(|e| eprintln!("lib-gst-meet: {:?}", e))
-    .unwrap_or(ptr::null_mut())
+  let _ = context;
+  (*conference).pipeline().to_glib_full()
 }
 
 #[no_mangle]

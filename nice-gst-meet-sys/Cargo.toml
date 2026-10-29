@@ -58,10 +58,10 @@ gobject-sys = { version = "0.22", default-features = false }
 windows-sys = { version = "0.61", features = ["Win32_Networking_WinSock"] }
 
 [build-dependencies]
-system-deps = { version = "7", default-features = false }
+system-deps = { version = "9", default-features = false }
 
 [dev-dependencies]
-shell-words = { version = "1", default-features = false }
+shell-words = { version = "1", default-features = false, features = ["std"] }
 tempfile = { version = "3", default-features = false }
 
 [features]

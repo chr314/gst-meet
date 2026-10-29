@@ -2,15 +2,16 @@
 // from ../../gir-files (@ 8e47c67)
 // DO NOT EDIT
 
-use std::{boxed::Box as Box_, fmt, mem::transmute, ptr, slice};
+use std::{boxed::Box as Box_, fmt, mem::transmute, ptr, slice, sync::Mutex};
 
 use glib::{
   ffi::gpointer,
-  object::ObjectType as ObjectType_,
+  object::{ObjectExt as _, ObjectType as ObjectType_},
   signal::{connect_raw, SignalHandlerId},
   translate::*,
   types::StaticType,
   value::ToValue,
+  Quark,
 };
 use libc::{c_char, c_uint};
 use nice_sys as ffi;
@@ -18,10 +19,7 @@ use nice_sys as ffi;
 #[cfg(any(feature = "v0_1_15", feature = "dox"))]
 #[cfg_attr(feature = "dox", doc(cfg(feature = "v0_1_15")))]
 use crate::AgentOption;
-#[cfg(any(feature = "v0_1_8", feature = "dox"))]
-#[cfg_attr(feature = "dox", doc(cfg(feature = "v0_1_8")))]
-use crate::ComponentState;
-use crate::{Candidate, Compatibility, RelayType};
+use crate::{Candidate, Compatibility, ComponentState, RelayType};
 
 glib::wrapper! {
     #[doc(alias = "NiceAgent")]
@@ -35,7 +33,20 @@ glib::wrapper! {
 unsafe impl Send for Agent {}
 unsafe impl Sync for Agent {}
 
-extern "C" fn attach_recv_cb(
+type RecvFn = dyn FnMut(Agent, u32, u32, &[u8]) + Send + 'static;
+
+struct RecvClosure(Box<RecvFn>);
+
+/// Closures given to `attach_recv`, owned by the agent (as qdata) and dropped with it.
+///
+/// `nice_agent_attach_recv` has no destroy notify, so there is no point at which libnice is known to be done with
+/// its user data. Keeping every closure until the agent is finalized rules out both a leak and a use after free.
+// Boxed so that the address handed to libnice survives the Vec growing.
+#[allow(clippy::vec_box)]
+#[derive(Default)]
+struct RecvClosures(Mutex<Vec<Box<RecvClosure>>>);
+
+unsafe extern "C" fn attach_recv_cb(
   agent: *mut ffi::NiceAgent,
   stream_id: c_uint,
   component_id: c_uint,
@@ -43,20 +54,31 @@ extern "C" fn attach_recv_cb(
   data: *mut c_char,
   user_data: gpointer,
 ) {
-  if !user_data.is_null() {
-    let closure: &mut Box<dyn FnMut(Agent, u32, u32, &str)> =
-      unsafe { &mut *(user_data as *mut _) };
-    let slice = unsafe { slice::from_raw_parts(data, len as usize) };
-    let bytes: Vec<_> = slice.iter().map(|b| *b as u8).collect();
-    if let Ok(s) = std::str::from_utf8(&bytes) {
-      closure(
-        unsafe { Agent::from_glib_none(agent) },
-        stream_id as u32,
-        component_id as u32,
-        s,
-      );
-    }
+  if user_data.is_null() {
+    return;
   }
+  let closure = &mut *(user_data as *mut RecvClosure);
+  let data = if data.is_null() || len == 0 {
+    &[]
+  }
+  else {
+    slice::from_raw_parts(data as *const u8, len as usize)
+  };
+  (closure.0)(Agent::from_glib_none(agent), stream_id, component_id, data);
+}
+
+type CloseFn = Box<dyn FnOnce() + Send + 'static>;
+
+// The GAsyncResult is not looked at (libnice documents that closing never fails), so it is left generic rather
+// than named, which would take a dependency on gio.
+#[cfg(any(feature = "v0_1_16", feature = "dox"))]
+unsafe extern "C" fn close_async_cb<AsyncResult>(
+  _source: *mut glib::gobject_ffi::GObject,
+  _result: *mut AsyncResult,
+  user_data: gpointer,
+) {
+  let callback = Box::from_raw(user_data as *mut CloseFn);
+  callback();
 }
 
 impl Agent {
@@ -98,25 +120,104 @@ impl Agent {
     unsafe { ffi::nice_agent_add_stream(self.to_glib_none().0, n_components) }
   }
 
+  fn recv_closures(&self) -> &RecvClosures {
+    static INIT: Mutex<()> = Mutex::new(());
+    let quark = Quark::from_str("nice-gst-meet-recv-closures");
+    unsafe {
+      let _guard = INIT.lock().unwrap_or_else(|e| e.into_inner());
+      let closures = match self.qdata::<RecvClosures>(quark) {
+        Some(closures) => closures,
+        None => {
+          self.set_qdata(quark, RecvClosures::default());
+          self
+            .qdata::<RecvClosures>(quark)
+            .expect("qdata was just set")
+        },
+      };
+      // The qdata is never replaced or stolen, so it lives as long as the agent.
+      &*closures.as_ptr()
+    }
+  }
+
+  /// Receives data for a component on `ctx`.
+  ///
+  /// The closure is dropped when the agent is finalized, so it must not hold a reference to the agent (it is passed
+  /// as the first argument instead).
   #[doc(alias = "nice_agent_attach_recv")]
   pub fn attach_recv(
     &self,
     stream_id: u32,
     component_id: u32,
     ctx: &glib::MainContext,
-    cb: impl FnMut(Agent, u32, u32, &str),
+    cb: impl FnMut(Agent, u32, u32, &[u8]) + Send + 'static,
   ) -> bool {
-    let cb = Box::new(Box::new(cb));
-    unsafe {
+    let mut closure = Box::new(RecvClosure(Box::new(cb)));
+    let user_data = &mut *closure as *mut RecvClosure;
+    let closures = self.recv_closures();
+    // Registered before attaching, since libnice may call back right away.
+    closures
+      .0
+      .lock()
+      .unwrap_or_else(|e| e.into_inner())
+      .push(closure);
+    let attached: bool = unsafe {
       from_glib(ffi::nice_agent_attach_recv(
         self.to_glib_none().0,
         stream_id,
         component_id,
         ctx.to_glib_none().0,
         Some(attach_recv_cb),
-        Box::into_raw(cb) as *mut _,
+        user_data as gpointer,
       ))
+    };
+    if !attached {
+      closures
+        .0
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .retain(|c| !ptr::eq(&**c, user_data));
     }
+    attached
+  }
+
+  /// Releases what the agent holds on remote servers: the allocations on TURN servers are freed by a refresh with a
+  /// lifetime of zero, and the streams are removed. The agent is of no use afterwards.
+  ///
+  /// `callback` runs on `ctx` when that is done, which takes as long as the server needs to answer, up to libnice's
+  /// retransmission timeout. Returns `false`, dropping `callback`, if the agent was closed before.
+  ///
+  /// libnice delivers the result on the thread-default context of the thread that starts the closing, and a
+  /// thread can only make a context its default if it owns it, which the thread that iterates `ctx` does. So
+  /// the closing is started from within `ctx`, and neither it nor `callback` happens if `ctx` is not iterated.
+  #[cfg(any(feature = "v0_1_16", feature = "dox"))]
+  #[cfg_attr(feature = "dox", doc(cfg(feature = "v0_1_16")))]
+  #[doc(alias = "nice_agent_close_async")]
+  pub fn close_async(&self, ctx: &glib::MainContext, callback: impl FnOnce() + Send + 'static) -> bool {
+    // libnice refuses a second close while one is in progress, and the callback would be lost.
+    static GUARD: Mutex<()> = Mutex::new(());
+    let quark = Quark::from_str("nice-gst-meet-closed");
+    {
+      let _guard = GUARD.lock().unwrap_or_else(|e| e.into_inner());
+      unsafe {
+        if self.qdata::<bool>(quark).is_some() {
+          return false;
+        }
+        self.set_qdata(quark, true);
+      }
+    }
+    let agent = self.clone();
+    let callback: CloseFn = Box::new(callback);
+    let context = ctx.clone();
+    ctx.invoke(move || unsafe {
+      glib::ffi::g_main_context_push_thread_default(context.to_glib_none().0);
+      ffi::nice_agent_close_async(
+        agent.to_glib_none().0,
+        Some(close_async_cb),
+        Box::into_raw(Box::new(callback)) as gpointer,
+      );
+      glib::ffi::g_main_context_pop_thread_default(context.to_glib_none().0);
+    });
+    true
   }
 
   #[cfg(any(feature = "v0_1_20", feature = "dox"))]
@@ -258,6 +359,8 @@ impl Agent {
     }
   }
 
+  /// The returned candidates are copies. libnice only lends its own (they are freed when the selected pair changes),
+  /// so they are copied immediately.
   #[doc(alias = "nice_agent_get_selected_pair")]
   pub fn get_selected_pair(
     &self,
@@ -275,7 +378,7 @@ impl Agent {
         &mut remote,
       ));
       if ret {
-        Some((from_glib_full(local), from_glib_full(remote)))
+        Some((from_glib_none(local), from_glib_none(remote)))
       }
       else {
         None
@@ -1227,11 +1330,11 @@ impl Agent {
   }
 
   #[doc(alias = "candidate-gathering-done")]
-  pub fn connect_candidate_gathering_done<F: Fn(&Self, u32) + 'static>(
+  pub fn connect_candidate_gathering_done<F: Fn(&Self, u32) + Send + Sync + 'static>(
     &self,
     f: F,
   ) -> SignalHandlerId {
-    unsafe extern "C" fn candidate_gathering_done_trampoline<F: Fn(&Agent, u32) + 'static>(
+    unsafe extern "C" fn candidate_gathering_done_trampoline<F: Fn(&Agent, u32) + Send + Sync + 'static>(
       this: *mut ffi::NiceAgent,
       stream_id: libc::c_uint,
       f: glib::ffi::gpointer,
@@ -1244,7 +1347,7 @@ impl Agent {
       connect_raw(
         self.as_ptr() as *mut _,
         b"candidate-gathering-done\0".as_ptr() as *const _,
-        Some(transmute::<_, unsafe extern "C" fn()>(
+        Some(transmute::<*const (), unsafe extern "C" fn()>(
           candidate_gathering_done_trampoline::<F> as *const (),
         )),
         Box_::into_raw(f),
@@ -1253,12 +1356,14 @@ impl Agent {
   }
 
   #[doc(alias = "component-state-changed")]
-  pub fn connect_component_state_changed<F: Fn(&Self, u32, u32, u32) + 'static>(
+  pub fn connect_component_state_changed<
+    F: Fn(&Self, u32, u32, ComponentState) + Send + Sync + 'static,
+  >(
     &self,
     f: F,
   ) -> SignalHandlerId {
     unsafe extern "C" fn component_state_changed_trampoline<
-      F: Fn(&Agent, u32, u32, u32) + 'static,
+      F: Fn(&Agent, u32, u32, ComponentState) + Send + Sync + 'static,
     >(
       this: *mut ffi::NiceAgent,
       stream_id: libc::c_uint,
@@ -1267,14 +1372,19 @@ impl Agent {
       f: glib::ffi::gpointer,
     ) {
       let f: &F = &*(f as *const F);
-      f(&from_glib_borrow(this), stream_id, component_id, state)
+      f(
+        &from_glib_borrow(this),
+        stream_id,
+        component_id,
+        ComponentState::from_glib(state as ffi::NiceComponentState),
+      )
     }
     unsafe {
       let f: Box_<F> = Box_::new(f);
       connect_raw(
         self.as_ptr() as *mut _,
         b"component-state-changed\0".as_ptr() as *const _,
-        Some(transmute::<_, unsafe extern "C" fn()>(
+        Some(transmute::<*const (), unsafe extern "C" fn()>(
           component_state_changed_trampoline::<F> as *const (),
         )),
         Box_::into_raw(f),
@@ -1283,12 +1393,12 @@ impl Agent {
   }
 
   #[doc(alias = "initial-binding-request-received")]
-  pub fn connect_initial_binding_request_received<F: Fn(&Self, u32) + 'static>(
+  pub fn connect_initial_binding_request_received<F: Fn(&Self, u32) + Send + Sync + 'static>(
     &self,
     f: F,
   ) -> SignalHandlerId {
     unsafe extern "C" fn initial_binding_request_received_trampoline<
-      F: Fn(&Agent, u32) + 'static,
+      F: Fn(&Agent, u32) + Send + Sync + 'static,
     >(
       this: *mut ffi::NiceAgent,
       stream_id: libc::c_uint,
@@ -1302,7 +1412,7 @@ impl Agent {
       connect_raw(
         self.as_ptr() as *mut _,
         b"initial-binding-request-received\0".as_ptr() as *const _,
-        Some(transmute::<_, unsafe extern "C" fn()>(
+        Some(transmute::<*const (), unsafe extern "C" fn()>(
           initial_binding_request_received_trampoline::<F> as *const (),
         )),
         Box_::into_raw(f),
@@ -1312,11 +1422,11 @@ impl Agent {
 
   #[cfg_attr(feature = "v0_1_8", deprecated = "Since 0.1.8")]
   #[doc(alias = "new-candidate")]
-  pub fn connect_new_candidate<F: Fn(&Self, u32, u32, &str) + 'static>(
+  pub fn connect_new_candidate<F: Fn(&Self, u32, u32, &str) + Send + Sync + 'static>(
     &self,
     f: F,
   ) -> SignalHandlerId {
-    unsafe extern "C" fn new_candidate_trampoline<F: Fn(&Agent, u32, u32, &str) + 'static>(
+    unsafe extern "C" fn new_candidate_trampoline<F: Fn(&Agent, u32, u32, &str) + Send + Sync + 'static>(
       this: *mut ffi::NiceAgent,
       stream_id: libc::c_uint,
       component_id: libc::c_uint,
@@ -1336,7 +1446,7 @@ impl Agent {
       connect_raw(
         self.as_ptr() as *mut _,
         b"new-candidate\0".as_ptr() as *const _,
-        Some(transmute::<_, unsafe extern "C" fn()>(
+        Some(transmute::<*const (), unsafe extern "C" fn()>(
           new_candidate_trampoline::<F> as *const (),
         )),
         Box_::into_raw(f),
@@ -1347,11 +1457,11 @@ impl Agent {
   #[cfg(any(feature = "v0_1_8", feature = "dox"))]
   #[cfg_attr(feature = "dox", doc(cfg(feature = "v0_1_8")))]
   #[doc(alias = "new-candidate-full")]
-  pub fn connect_new_candidate_full<F: Fn(&Self, &Candidate) + 'static>(
+  pub fn connect_new_candidate_full<F: Fn(&Self, &Candidate) + Send + Sync + 'static>(
     &self,
     f: F,
   ) -> SignalHandlerId {
-    unsafe extern "C" fn new_candidate_full_trampoline<F: Fn(&Agent, &Candidate) + 'static>(
+    unsafe extern "C" fn new_candidate_full_trampoline<F: Fn(&Agent, &Candidate) + Send + Sync + 'static>(
       this: *mut ffi::NiceAgent,
       candidate: *mut ffi::NiceCandidate,
       f: glib::ffi::gpointer,
@@ -1364,7 +1474,7 @@ impl Agent {
       connect_raw(
         self.as_ptr() as *mut _,
         b"new-candidate-full\0".as_ptr() as *const _,
-        Some(transmute::<_, unsafe extern "C" fn()>(
+        Some(transmute::<*const (), unsafe extern "C" fn()>(
           new_candidate_full_trampoline::<F> as *const (),
         )),
         Box_::into_raw(f),
@@ -1374,12 +1484,12 @@ impl Agent {
 
   #[cfg_attr(feature = "v0_1_8", deprecated = "Since 0.1.8")]
   #[doc(alias = "new-remote-candidate")]
-  pub fn connect_new_remote_candidate<F: Fn(&Self, u32, u32, &str) + 'static>(
+  pub fn connect_new_remote_candidate<F: Fn(&Self, u32, u32, &str) + Send + Sync + 'static>(
     &self,
     f: F,
   ) -> SignalHandlerId {
     unsafe extern "C" fn new_remote_candidate_trampoline<
-      F: Fn(&Agent, u32, u32, &str) + 'static,
+      F: Fn(&Agent, u32, u32, &str) + Send + Sync + 'static,
     >(
       this: *mut ffi::NiceAgent,
       stream_id: libc::c_uint,
@@ -1400,7 +1510,7 @@ impl Agent {
       connect_raw(
         self.as_ptr() as *mut _,
         b"new-remote-candidate\0".as_ptr() as *const _,
-        Some(transmute::<_, unsafe extern "C" fn()>(
+        Some(transmute::<*const (), unsafe extern "C" fn()>(
           new_remote_candidate_trampoline::<F> as *const (),
         )),
         Box_::into_raw(f),
@@ -1411,12 +1521,12 @@ impl Agent {
   #[cfg(any(feature = "v0_1_8", feature = "dox"))]
   #[cfg_attr(feature = "dox", doc(cfg(feature = "v0_1_8")))]
   #[doc(alias = "new-remote-candidate-full")]
-  pub fn connect_new_remote_candidate_full<F: Fn(&Self, &Candidate) + 'static>(
+  pub fn connect_new_remote_candidate_full<F: Fn(&Self, &Candidate) + Send + Sync + 'static>(
     &self,
     f: F,
   ) -> SignalHandlerId {
     unsafe extern "C" fn new_remote_candidate_full_trampoline<
-      F: Fn(&Agent, &Candidate) + 'static,
+      F: Fn(&Agent, &Candidate) + Send + Sync + 'static,
     >(
       this: *mut ffi::NiceAgent,
       candidate: *mut ffi::NiceCandidate,
@@ -1430,7 +1540,7 @@ impl Agent {
       connect_raw(
         self.as_ptr() as *mut _,
         b"new-remote-candidate-full\0".as_ptr() as *const _,
-        Some(transmute::<_, unsafe extern "C" fn()>(
+        Some(transmute::<*const (), unsafe extern "C" fn()>(
           new_remote_candidate_full_trampoline::<F> as *const (),
         )),
         Box_::into_raw(f),
@@ -1440,12 +1550,12 @@ impl Agent {
 
   #[cfg_attr(feature = "v0_1_8", deprecated = "Since 0.1.8")]
   #[doc(alias = "new-selected-pair")]
-  pub fn connect_new_selected_pair<F: Fn(&Self, u32, u32, &str, &str) + 'static>(
+  pub fn connect_new_selected_pair<F: Fn(&Self, u32, u32, &str, &str) + Send + Sync + 'static>(
     &self,
     f: F,
   ) -> SignalHandlerId {
     unsafe extern "C" fn new_selected_pair_trampoline<
-      F: Fn(&Agent, u32, u32, &str, &str) + 'static,
+      F: Fn(&Agent, u32, u32, &str, &str) + Send + Sync + 'static,
     >(
       this: *mut ffi::NiceAgent,
       stream_id: libc::c_uint,
@@ -1468,7 +1578,7 @@ impl Agent {
       connect_raw(
         self.as_ptr() as *mut _,
         b"new-selected-pair\0".as_ptr() as *const _,
-        Some(transmute::<_, unsafe extern "C" fn()>(
+        Some(transmute::<*const (), unsafe extern "C" fn()>(
           new_selected_pair_trampoline::<F> as *const (),
         )),
         Box_::into_raw(f),
@@ -1480,13 +1590,13 @@ impl Agent {
   #[cfg_attr(feature = "dox", doc(cfg(feature = "v0_1_8")))]
   #[doc(alias = "new-selected-pair-full")]
   pub fn connect_new_selected_pair_full<
-    F: Fn(&Self, u32, u32, &Candidate, &Candidate) + 'static,
+    F: Fn(&Self, u32, u32, &Candidate, &Candidate) + Send + Sync + 'static,
   >(
     &self,
     f: F,
   ) -> SignalHandlerId {
     unsafe extern "C" fn new_selected_pair_full_trampoline<
-      F: Fn(&Agent, u32, u32, &Candidate, &Candidate) + 'static,
+      F: Fn(&Agent, u32, u32, &Candidate, &Candidate) + Send + Sync + 'static,
     >(
       this: *mut ffi::NiceAgent,
       stream_id: libc::c_uint,
@@ -1509,7 +1619,7 @@ impl Agent {
       connect_raw(
         self.as_ptr() as *mut _,
         b"new-selected-pair-full\0".as_ptr() as *const _,
-        Some(transmute::<_, unsafe extern "C" fn()>(
+        Some(transmute::<*const (), unsafe extern "C" fn()>(
           new_selected_pair_full_trampoline::<F> as *const (),
         )),
         Box_::into_raw(f),
@@ -1518,12 +1628,12 @@ impl Agent {
   }
 
   #[doc(alias = "reliable-transport-writable")]
-  pub fn connect_reliable_transport_writable<F: Fn(&Self, u32, u32) + 'static>(
+  pub fn connect_reliable_transport_writable<F: Fn(&Self, u32, u32) + Send + Sync + 'static>(
     &self,
     f: F,
   ) -> SignalHandlerId {
     unsafe extern "C" fn reliable_transport_writable_trampoline<
-      F: Fn(&Agent, u32, u32) + 'static,
+      F: Fn(&Agent, u32, u32) + Send + Sync + 'static,
     >(
       this: *mut ffi::NiceAgent,
       stream_id: libc::c_uint,
@@ -1538,7 +1648,7 @@ impl Agent {
       connect_raw(
         self.as_ptr() as *mut _,
         b"reliable-transport-writable\0".as_ptr() as *const _,
-        Some(transmute::<_, unsafe extern "C" fn()>(
+        Some(transmute::<*const (), unsafe extern "C" fn()>(
           reliable_transport_writable_trampoline::<F> as *const (),
         )),
         Box_::into_raw(f),
@@ -1556,8 +1666,8 @@ impl Agent {
   #[cfg(any(feature = "v0_1_8", feature = "dox"))]
   #[cfg_attr(feature = "dox", doc(cfg(feature = "v0_1_8")))]
   #[doc(alias = "bytestream-tcp")]
-  pub fn connect_bytestream_tcp_notify<F: Fn(&Self) + 'static>(&self, f: F) -> SignalHandlerId {
-    unsafe extern "C" fn notify_bytestream_tcp_trampoline<F: Fn(&Agent) + 'static>(
+  pub fn connect_bytestream_tcp_notify<F: Fn(&Self) + Send + Sync + 'static>(&self, f: F) -> SignalHandlerId {
+    unsafe extern "C" fn notify_bytestream_tcp_trampoline<F: Fn(&Agent) + Send + Sync + 'static>(
       this: *mut ffi::NiceAgent,
       _param_spec: glib::ffi::gpointer,
       f: glib::ffi::gpointer,
@@ -1570,7 +1680,7 @@ impl Agent {
       connect_raw(
         self.as_ptr() as *mut _,
         b"notify::bytestream-tcp\0".as_ptr() as *const _,
-        Some(transmute::<_, unsafe extern "C" fn()>(
+        Some(transmute::<*const (), unsafe extern "C" fn()>(
           notify_bytestream_tcp_trampoline::<F> as *const (),
         )),
         Box_::into_raw(f),
@@ -1579,8 +1689,8 @@ impl Agent {
   }
 
   #[doc(alias = "controlling-mode")]
-  pub fn connect_controlling_mode_notify<F: Fn(&Self) + 'static>(&self, f: F) -> SignalHandlerId {
-    unsafe extern "C" fn notify_controlling_mode_trampoline<F: Fn(&Agent) + 'static>(
+  pub fn connect_controlling_mode_notify<F: Fn(&Self) + Send + Sync + 'static>(&self, f: F) -> SignalHandlerId {
+    unsafe extern "C" fn notify_controlling_mode_trampoline<F: Fn(&Agent) + Send + Sync + 'static>(
       this: *mut ffi::NiceAgent,
       _param_spec: glib::ffi::gpointer,
       f: glib::ffi::gpointer,
@@ -1593,7 +1703,7 @@ impl Agent {
       connect_raw(
         self.as_ptr() as *mut _,
         b"notify::controlling-mode\0".as_ptr() as *const _,
-        Some(transmute::<_, unsafe extern "C" fn()>(
+        Some(transmute::<*const (), unsafe extern "C" fn()>(
           notify_controlling_mode_trampoline::<F> as *const (),
         )),
         Box_::into_raw(f),
@@ -1604,8 +1714,8 @@ impl Agent {
   #[cfg(any(feature = "v0_1_14", feature = "dox"))]
   #[cfg_attr(feature = "dox", doc(cfg(feature = "v0_1_14")))]
   #[doc(alias = "force-relay")]
-  pub fn connect_force_relay_notify<F: Fn(&Self) + 'static>(&self, f: F) -> SignalHandlerId {
-    unsafe extern "C" fn notify_force_relay_trampoline<F: Fn(&Agent) + 'static>(
+  pub fn connect_force_relay_notify<F: Fn(&Self) + Send + Sync + 'static>(&self, f: F) -> SignalHandlerId {
+    unsafe extern "C" fn notify_force_relay_trampoline<F: Fn(&Agent) + Send + Sync + 'static>(
       this: *mut ffi::NiceAgent,
       _param_spec: glib::ffi::gpointer,
       f: glib::ffi::gpointer,
@@ -1618,7 +1728,7 @@ impl Agent {
       connect_raw(
         self.as_ptr() as *mut _,
         b"notify::force-relay\0".as_ptr() as *const _,
-        Some(transmute::<_, unsafe extern "C" fn()>(
+        Some(transmute::<*const (), unsafe extern "C" fn()>(
           notify_force_relay_trampoline::<F> as *const (),
         )),
         Box_::into_raw(f),
@@ -1629,8 +1739,8 @@ impl Agent {
   #[cfg(any(feature = "v0_1_8", feature = "dox"))]
   #[cfg_attr(feature = "dox", doc(cfg(feature = "v0_1_8")))]
   #[doc(alias = "ice-tcp")]
-  pub fn connect_ice_tcp_notify<F: Fn(&Self) + 'static>(&self, f: F) -> SignalHandlerId {
-    unsafe extern "C" fn notify_ice_tcp_trampoline<F: Fn(&Agent) + 'static>(
+  pub fn connect_ice_tcp_notify<F: Fn(&Self) + Send + Sync + 'static>(&self, f: F) -> SignalHandlerId {
+    unsafe extern "C" fn notify_ice_tcp_trampoline<F: Fn(&Agent) + Send + Sync + 'static>(
       this: *mut ffi::NiceAgent,
       _param_spec: glib::ffi::gpointer,
       f: glib::ffi::gpointer,
@@ -1643,7 +1753,7 @@ impl Agent {
       connect_raw(
         self.as_ptr() as *mut _,
         b"notify::ice-tcp\0".as_ptr() as *const _,
-        Some(transmute::<_, unsafe extern "C" fn()>(
+        Some(transmute::<*const (), unsafe extern "C" fn()>(
           notify_ice_tcp_trampoline::<F> as *const (),
         )),
         Box_::into_raw(f),
@@ -1654,8 +1764,8 @@ impl Agent {
   #[cfg(any(feature = "v0_1_16", feature = "dox"))]
   #[cfg_attr(feature = "dox", doc(cfg(feature = "v0_1_16")))]
   #[doc(alias = "ice-trickle")]
-  pub fn connect_ice_trickle_notify<F: Fn(&Self) + 'static>(&self, f: F) -> SignalHandlerId {
-    unsafe extern "C" fn notify_ice_trickle_trampoline<F: Fn(&Agent) + 'static>(
+  pub fn connect_ice_trickle_notify<F: Fn(&Self) + Send + Sync + 'static>(&self, f: F) -> SignalHandlerId {
+    unsafe extern "C" fn notify_ice_trickle_trampoline<F: Fn(&Agent) + Send + Sync + 'static>(
       this: *mut ffi::NiceAgent,
       _param_spec: glib::ffi::gpointer,
       f: glib::ffi::gpointer,
@@ -1668,7 +1778,7 @@ impl Agent {
       connect_raw(
         self.as_ptr() as *mut _,
         b"notify::ice-trickle\0".as_ptr() as *const _,
-        Some(transmute::<_, unsafe extern "C" fn()>(
+        Some(transmute::<*const (), unsafe extern "C" fn()>(
           notify_ice_trickle_trampoline::<F> as *const (),
         )),
         Box_::into_raw(f),
@@ -1679,8 +1789,8 @@ impl Agent {
   #[cfg(any(feature = "v0_1_8", feature = "dox"))]
   #[cfg_attr(feature = "dox", doc(cfg(feature = "v0_1_8")))]
   #[doc(alias = "ice-udp")]
-  pub fn connect_ice_udp_notify<F: Fn(&Self) + 'static>(&self, f: F) -> SignalHandlerId {
-    unsafe extern "C" fn notify_ice_udp_trampoline<F: Fn(&Agent) + 'static>(
+  pub fn connect_ice_udp_notify<F: Fn(&Self) + Send + Sync + 'static>(&self, f: F) -> SignalHandlerId {
+    unsafe extern "C" fn notify_ice_udp_trampoline<F: Fn(&Agent) + Send + Sync + 'static>(
       this: *mut ffi::NiceAgent,
       _param_spec: glib::ffi::gpointer,
       f: glib::ffi::gpointer,
@@ -1693,7 +1803,7 @@ impl Agent {
       connect_raw(
         self.as_ptr() as *mut _,
         b"notify::ice-udp\0".as_ptr() as *const _,
-        Some(transmute::<_, unsafe extern "C" fn()>(
+        Some(transmute::<*const (), unsafe extern "C" fn()>(
           notify_ice_udp_trampoline::<F> as *const (),
         )),
         Box_::into_raw(f),
@@ -1704,8 +1814,8 @@ impl Agent {
   #[cfg(any(feature = "v0_1_17", feature = "dox"))]
   #[cfg_attr(feature = "dox", doc(cfg(feature = "v0_1_17")))]
   #[doc(alias = "idle-timeout")]
-  pub fn connect_idle_timeout_notify<F: Fn(&Self) + 'static>(&self, f: F) -> SignalHandlerId {
-    unsafe extern "C" fn notify_idle_timeout_trampoline<F: Fn(&Agent) + 'static>(
+  pub fn connect_idle_timeout_notify<F: Fn(&Self) + Send + Sync + 'static>(&self, f: F) -> SignalHandlerId {
+    unsafe extern "C" fn notify_idle_timeout_trampoline<F: Fn(&Agent) + Send + Sync + 'static>(
       this: *mut ffi::NiceAgent,
       _param_spec: glib::ffi::gpointer,
       f: glib::ffi::gpointer,
@@ -1718,7 +1828,7 @@ impl Agent {
       connect_raw(
         self.as_ptr() as *mut _,
         b"notify::idle-timeout\0".as_ptr() as *const _,
-        Some(transmute::<_, unsafe extern "C" fn()>(
+        Some(transmute::<*const (), unsafe extern "C" fn()>(
           notify_idle_timeout_trampoline::<F> as *const (),
         )),
         Box_::into_raw(f),
@@ -1729,11 +1839,11 @@ impl Agent {
   #[cfg(any(feature = "v0_1_8", feature = "dox"))]
   #[cfg_attr(feature = "dox", doc(cfg(feature = "v0_1_8")))]
   #[doc(alias = "keepalive-conncheck")]
-  pub fn connect_keepalive_conncheck_notify<F: Fn(&Self) + 'static>(
+  pub fn connect_keepalive_conncheck_notify<F: Fn(&Self) + Send + Sync + 'static>(
     &self,
     f: F,
   ) -> SignalHandlerId {
-    unsafe extern "C" fn notify_keepalive_conncheck_trampoline<F: Fn(&Agent) + 'static>(
+    unsafe extern "C" fn notify_keepalive_conncheck_trampoline<F: Fn(&Agent) + Send + Sync + 'static>(
       this: *mut ffi::NiceAgent,
       _param_spec: glib::ffi::gpointer,
       f: glib::ffi::gpointer,
@@ -1746,7 +1856,7 @@ impl Agent {
       connect_raw(
         self.as_ptr() as *mut _,
         b"notify::keepalive-conncheck\0".as_ptr() as *const _,
-        Some(transmute::<_, unsafe extern "C" fn()>(
+        Some(transmute::<*const (), unsafe extern "C" fn()>(
           notify_keepalive_conncheck_trampoline::<F> as *const (),
         )),
         Box_::into_raw(f),
@@ -1755,11 +1865,11 @@ impl Agent {
   }
 
   #[doc(alias = "max-connectivity-checks")]
-  pub fn connect_max_connectivity_checks_notify<F: Fn(&Self) + 'static>(
+  pub fn connect_max_connectivity_checks_notify<F: Fn(&Self) + Send + Sync + 'static>(
     &self,
     f: F,
   ) -> SignalHandlerId {
-    unsafe extern "C" fn notify_max_connectivity_checks_trampoline<F: Fn(&Agent) + 'static>(
+    unsafe extern "C" fn notify_max_connectivity_checks_trampoline<F: Fn(&Agent) + Send + Sync + 'static>(
       this: *mut ffi::NiceAgent,
       _param_spec: glib::ffi::gpointer,
       f: glib::ffi::gpointer,
@@ -1772,7 +1882,7 @@ impl Agent {
       connect_raw(
         self.as_ptr() as *mut _,
         b"notify::max-connectivity-checks\0".as_ptr() as *const _,
-        Some(transmute::<_, unsafe extern "C" fn()>(
+        Some(transmute::<*const (), unsafe extern "C" fn()>(
           notify_max_connectivity_checks_trampoline::<F> as *const (),
         )),
         Box_::into_raw(f),
@@ -1781,8 +1891,8 @@ impl Agent {
   }
 
   #[doc(alias = "proxy-ip")]
-  pub fn connect_proxy_ip_notify<F: Fn(&Self) + 'static>(&self, f: F) -> SignalHandlerId {
-    unsafe extern "C" fn notify_proxy_ip_trampoline<F: Fn(&Agent) + 'static>(
+  pub fn connect_proxy_ip_notify<F: Fn(&Self) + Send + Sync + 'static>(&self, f: F) -> SignalHandlerId {
+    unsafe extern "C" fn notify_proxy_ip_trampoline<F: Fn(&Agent) + Send + Sync + 'static>(
       this: *mut ffi::NiceAgent,
       _param_spec: glib::ffi::gpointer,
       f: glib::ffi::gpointer,
@@ -1795,7 +1905,7 @@ impl Agent {
       connect_raw(
         self.as_ptr() as *mut _,
         b"notify::proxy-ip\0".as_ptr() as *const _,
-        Some(transmute::<_, unsafe extern "C" fn()>(
+        Some(transmute::<*const (), unsafe extern "C" fn()>(
           notify_proxy_ip_trampoline::<F> as *const (),
         )),
         Box_::into_raw(f),
@@ -1804,8 +1914,8 @@ impl Agent {
   }
 
   #[doc(alias = "proxy-password")]
-  pub fn connect_proxy_password_notify<F: Fn(&Self) + 'static>(&self, f: F) -> SignalHandlerId {
-    unsafe extern "C" fn notify_proxy_password_trampoline<F: Fn(&Agent) + 'static>(
+  pub fn connect_proxy_password_notify<F: Fn(&Self) + Send + Sync + 'static>(&self, f: F) -> SignalHandlerId {
+    unsafe extern "C" fn notify_proxy_password_trampoline<F: Fn(&Agent) + Send + Sync + 'static>(
       this: *mut ffi::NiceAgent,
       _param_spec: glib::ffi::gpointer,
       f: glib::ffi::gpointer,
@@ -1818,7 +1928,7 @@ impl Agent {
       connect_raw(
         self.as_ptr() as *mut _,
         b"notify::proxy-password\0".as_ptr() as *const _,
-        Some(transmute::<_, unsafe extern "C" fn()>(
+        Some(transmute::<*const (), unsafe extern "C" fn()>(
           notify_proxy_password_trampoline::<F> as *const (),
         )),
         Box_::into_raw(f),
@@ -1827,8 +1937,8 @@ impl Agent {
   }
 
   #[doc(alias = "proxy-port")]
-  pub fn connect_proxy_port_notify<F: Fn(&Self) + 'static>(&self, f: F) -> SignalHandlerId {
-    unsafe extern "C" fn notify_proxy_port_trampoline<F: Fn(&Agent) + 'static>(
+  pub fn connect_proxy_port_notify<F: Fn(&Self) + Send + Sync + 'static>(&self, f: F) -> SignalHandlerId {
+    unsafe extern "C" fn notify_proxy_port_trampoline<F: Fn(&Agent) + Send + Sync + 'static>(
       this: *mut ffi::NiceAgent,
       _param_spec: glib::ffi::gpointer,
       f: glib::ffi::gpointer,
@@ -1841,7 +1951,7 @@ impl Agent {
       connect_raw(
         self.as_ptr() as *mut _,
         b"notify::proxy-port\0".as_ptr() as *const _,
-        Some(transmute::<_, unsafe extern "C" fn()>(
+        Some(transmute::<*const (), unsafe extern "C" fn()>(
           notify_proxy_port_trampoline::<F> as *const (),
         )),
         Box_::into_raw(f),
@@ -1850,8 +1960,8 @@ impl Agent {
   }
 
   #[doc(alias = "proxy-type")]
-  pub fn connect_proxy_type_notify<F: Fn(&Self) + 'static>(&self, f: F) -> SignalHandlerId {
-    unsafe extern "C" fn notify_proxy_type_trampoline<F: Fn(&Agent) + 'static>(
+  pub fn connect_proxy_type_notify<F: Fn(&Self) + Send + Sync + 'static>(&self, f: F) -> SignalHandlerId {
+    unsafe extern "C" fn notify_proxy_type_trampoline<F: Fn(&Agent) + Send + Sync + 'static>(
       this: *mut ffi::NiceAgent,
       _param_spec: glib::ffi::gpointer,
       f: glib::ffi::gpointer,
@@ -1864,7 +1974,7 @@ impl Agent {
       connect_raw(
         self.as_ptr() as *mut _,
         b"notify::proxy-type\0".as_ptr() as *const _,
-        Some(transmute::<_, unsafe extern "C" fn()>(
+        Some(transmute::<*const (), unsafe extern "C" fn()>(
           notify_proxy_type_trampoline::<F> as *const (),
         )),
         Box_::into_raw(f),
@@ -1873,8 +1983,8 @@ impl Agent {
   }
 
   #[doc(alias = "proxy-username")]
-  pub fn connect_proxy_username_notify<F: Fn(&Self) + 'static>(&self, f: F) -> SignalHandlerId {
-    unsafe extern "C" fn notify_proxy_username_trampoline<F: Fn(&Agent) + 'static>(
+  pub fn connect_proxy_username_notify<F: Fn(&Self) + Send + Sync + 'static>(&self, f: F) -> SignalHandlerId {
+    unsafe extern "C" fn notify_proxy_username_trampoline<F: Fn(&Agent) + Send + Sync + 'static>(
       this: *mut ffi::NiceAgent,
       _param_spec: glib::ffi::gpointer,
       f: glib::ffi::gpointer,
@@ -1887,7 +1997,7 @@ impl Agent {
       connect_raw(
         self.as_ptr() as *mut _,
         b"notify::proxy-username\0".as_ptr() as *const _,
-        Some(transmute::<_, unsafe extern "C" fn()>(
+        Some(transmute::<*const (), unsafe extern "C" fn()>(
           notify_proxy_username_trampoline::<F> as *const (),
         )),
         Box_::into_raw(f),
@@ -1898,11 +2008,11 @@ impl Agent {
   #[cfg(any(feature = "v0_1_15", feature = "dox"))]
   #[cfg_attr(feature = "dox", doc(cfg(feature = "v0_1_15")))]
   #[doc(alias = "stun-initial-timeout")]
-  pub fn connect_stun_initial_timeout_notify<F: Fn(&Self) + 'static>(
+  pub fn connect_stun_initial_timeout_notify<F: Fn(&Self) + Send + Sync + 'static>(
     &self,
     f: F,
   ) -> SignalHandlerId {
-    unsafe extern "C" fn notify_stun_initial_timeout_trampoline<F: Fn(&Agent) + 'static>(
+    unsafe extern "C" fn notify_stun_initial_timeout_trampoline<F: Fn(&Agent) + Send + Sync + 'static>(
       this: *mut ffi::NiceAgent,
       _param_spec: glib::ffi::gpointer,
       f: glib::ffi::gpointer,
@@ -1915,7 +2025,7 @@ impl Agent {
       connect_raw(
         self.as_ptr() as *mut _,
         b"notify::stun-initial-timeout\0".as_ptr() as *const _,
-        Some(transmute::<_, unsafe extern "C" fn()>(
+        Some(transmute::<*const (), unsafe extern "C" fn()>(
           notify_stun_initial_timeout_trampoline::<F> as *const (),
         )),
         Box_::into_raw(f),
@@ -1926,11 +2036,11 @@ impl Agent {
   #[cfg(any(feature = "v0_1_15", feature = "dox"))]
   #[cfg_attr(feature = "dox", doc(cfg(feature = "v0_1_15")))]
   #[doc(alias = "stun-max-retransmissions")]
-  pub fn connect_stun_max_retransmissions_notify<F: Fn(&Self) + 'static>(
+  pub fn connect_stun_max_retransmissions_notify<F: Fn(&Self) + Send + Sync + 'static>(
     &self,
     f: F,
   ) -> SignalHandlerId {
-    unsafe extern "C" fn notify_stun_max_retransmissions_trampoline<F: Fn(&Agent) + 'static>(
+    unsafe extern "C" fn notify_stun_max_retransmissions_trampoline<F: Fn(&Agent) + Send + Sync + 'static>(
       this: *mut ffi::NiceAgent,
       _param_spec: glib::ffi::gpointer,
       f: glib::ffi::gpointer,
@@ -1943,7 +2053,7 @@ impl Agent {
       connect_raw(
         self.as_ptr() as *mut _,
         b"notify::stun-max-retransmissions\0".as_ptr() as *const _,
-        Some(transmute::<_, unsafe extern "C" fn()>(
+        Some(transmute::<*const (), unsafe extern "C" fn()>(
           notify_stun_max_retransmissions_trampoline::<F> as *const (),
         )),
         Box_::into_raw(f),
@@ -1952,8 +2062,8 @@ impl Agent {
   }
 
   #[doc(alias = "stun-pacing-timer")]
-  pub fn connect_stun_pacing_timer_notify<F: Fn(&Self) + 'static>(&self, f: F) -> SignalHandlerId {
-    unsafe extern "C" fn notify_stun_pacing_timer_trampoline<F: Fn(&Agent) + 'static>(
+  pub fn connect_stun_pacing_timer_notify<F: Fn(&Self) + Send + Sync + 'static>(&self, f: F) -> SignalHandlerId {
+    unsafe extern "C" fn notify_stun_pacing_timer_trampoline<F: Fn(&Agent) + Send + Sync + 'static>(
       this: *mut ffi::NiceAgent,
       _param_spec: glib::ffi::gpointer,
       f: glib::ffi::gpointer,
@@ -1966,7 +2076,7 @@ impl Agent {
       connect_raw(
         self.as_ptr() as *mut _,
         b"notify::stun-pacing-timer\0".as_ptr() as *const _,
-        Some(transmute::<_, unsafe extern "C" fn()>(
+        Some(transmute::<*const (), unsafe extern "C" fn()>(
           notify_stun_pacing_timer_trampoline::<F> as *const (),
         )),
         Box_::into_raw(f),
@@ -1977,11 +2087,11 @@ impl Agent {
   #[cfg(any(feature = "v0_1_15", feature = "dox"))]
   #[cfg_attr(feature = "dox", doc(cfg(feature = "v0_1_15")))]
   #[doc(alias = "stun-reliable-timeout")]
-  pub fn connect_stun_reliable_timeout_notify<F: Fn(&Self) + 'static>(
+  pub fn connect_stun_reliable_timeout_notify<F: Fn(&Self) + Send + Sync + 'static>(
     &self,
     f: F,
   ) -> SignalHandlerId {
-    unsafe extern "C" fn notify_stun_reliable_timeout_trampoline<F: Fn(&Agent) + 'static>(
+    unsafe extern "C" fn notify_stun_reliable_timeout_trampoline<F: Fn(&Agent) + Send + Sync + 'static>(
       this: *mut ffi::NiceAgent,
       _param_spec: glib::ffi::gpointer,
       f: glib::ffi::gpointer,
@@ -1994,7 +2104,7 @@ impl Agent {
       connect_raw(
         self.as_ptr() as *mut _,
         b"notify::stun-reliable-timeout\0".as_ptr() as *const _,
-        Some(transmute::<_, unsafe extern "C" fn()>(
+        Some(transmute::<*const (), unsafe extern "C" fn()>(
           notify_stun_reliable_timeout_trampoline::<F> as *const (),
         )),
         Box_::into_raw(f),
@@ -2003,8 +2113,8 @@ impl Agent {
   }
 
   #[doc(alias = "stun-server")]
-  pub fn connect_stun_server_notify<F: Fn(&Self) + 'static>(&self, f: F) -> SignalHandlerId {
-    unsafe extern "C" fn notify_stun_server_trampoline<F: Fn(&Agent) + 'static>(
+  pub fn connect_stun_server_notify<F: Fn(&Self) + Send + Sync + 'static>(&self, f: F) -> SignalHandlerId {
+    unsafe extern "C" fn notify_stun_server_trampoline<F: Fn(&Agent) + Send + Sync + 'static>(
       this: *mut ffi::NiceAgent,
       _param_spec: glib::ffi::gpointer,
       f: glib::ffi::gpointer,
@@ -2017,7 +2127,7 @@ impl Agent {
       connect_raw(
         self.as_ptr() as *mut _,
         b"notify::stun-server\0".as_ptr() as *const _,
-        Some(transmute::<_, unsafe extern "C" fn()>(
+        Some(transmute::<*const (), unsafe extern "C" fn()>(
           notify_stun_server_trampoline::<F> as *const (),
         )),
         Box_::into_raw(f),
@@ -2026,8 +2136,8 @@ impl Agent {
   }
 
   #[doc(alias = "stun-server-port")]
-  pub fn connect_stun_server_port_notify<F: Fn(&Self) + 'static>(&self, f: F) -> SignalHandlerId {
-    unsafe extern "C" fn notify_stun_server_port_trampoline<F: Fn(&Agent) + 'static>(
+  pub fn connect_stun_server_port_notify<F: Fn(&Self) + Send + Sync + 'static>(&self, f: F) -> SignalHandlerId {
+    unsafe extern "C" fn notify_stun_server_port_trampoline<F: Fn(&Agent) + Send + Sync + 'static>(
       this: *mut ffi::NiceAgent,
       _param_spec: glib::ffi::gpointer,
       f: glib::ffi::gpointer,
@@ -2040,7 +2150,7 @@ impl Agent {
       connect_raw(
         self.as_ptr() as *mut _,
         b"notify::stun-server-port\0".as_ptr() as *const _,
-        Some(transmute::<_, unsafe extern "C" fn()>(
+        Some(transmute::<*const (), unsafe extern "C" fn()>(
           notify_stun_server_port_trampoline::<F> as *const (),
         )),
         Box_::into_raw(f),
@@ -2049,11 +2159,11 @@ impl Agent {
   }
 
   #[doc(alias = "support-renomination")]
-  pub fn connect_support_renomination_notify<F: Fn(&Self) + 'static>(
+  pub fn connect_support_renomination_notify<F: Fn(&Self) + Send + Sync + 'static>(
     &self,
     f: F,
   ) -> SignalHandlerId {
-    unsafe extern "C" fn notify_support_renomination_trampoline<F: Fn(&Agent) + 'static>(
+    unsafe extern "C" fn notify_support_renomination_trampoline<F: Fn(&Agent) + Send + Sync + 'static>(
       this: *mut ffi::NiceAgent,
       _param_spec: glib::ffi::gpointer,
       f: glib::ffi::gpointer,
@@ -2066,7 +2176,7 @@ impl Agent {
       connect_raw(
         self.as_ptr() as *mut _,
         b"notify::support-renomination\0".as_ptr() as *const _,
-        Some(transmute::<_, unsafe extern "C" fn()>(
+        Some(transmute::<*const (), unsafe extern "C" fn()>(
           notify_support_renomination_trampoline::<F> as *const (),
         )),
         Box_::into_raw(f),
@@ -2075,8 +2185,8 @@ impl Agent {
   }
 
   #[doc(alias = "upnp")]
-  pub fn connect_upnp_notify<F: Fn(&Self) + 'static>(&self, f: F) -> SignalHandlerId {
-    unsafe extern "C" fn notify_upnp_trampoline<F: Fn(&Agent) + 'static>(
+  pub fn connect_upnp_notify<F: Fn(&Self) + Send + Sync + 'static>(&self, f: F) -> SignalHandlerId {
+    unsafe extern "C" fn notify_upnp_trampoline<F: Fn(&Agent) + Send + Sync + 'static>(
       this: *mut ffi::NiceAgent,
       _param_spec: glib::ffi::gpointer,
       f: glib::ffi::gpointer,
@@ -2089,7 +2199,7 @@ impl Agent {
       connect_raw(
         self.as_ptr() as *mut _,
         b"notify::upnp\0".as_ptr() as *const _,
-        Some(transmute::<_, unsafe extern "C" fn()>(
+        Some(transmute::<*const (), unsafe extern "C" fn()>(
           notify_upnp_trampoline::<F> as *const (),
         )),
         Box_::into_raw(f),
@@ -2098,8 +2208,8 @@ impl Agent {
   }
 
   #[doc(alias = "upnp-timeout")]
-  pub fn connect_upnp_timeout_notify<F: Fn(&Self) + 'static>(&self, f: F) -> SignalHandlerId {
-    unsafe extern "C" fn notify_upnp_timeout_trampoline<F: Fn(&Agent) + 'static>(
+  pub fn connect_upnp_timeout_notify<F: Fn(&Self) + Send + Sync + 'static>(&self, f: F) -> SignalHandlerId {
+    unsafe extern "C" fn notify_upnp_timeout_trampoline<F: Fn(&Agent) + Send + Sync + 'static>(
       this: *mut ffi::NiceAgent,
       _param_spec: glib::ffi::gpointer,
       f: glib::ffi::gpointer,
@@ -2112,7 +2222,7 @@ impl Agent {
       connect_raw(
         self.as_ptr() as *mut _,
         b"notify::upnp-timeout\0".as_ptr() as *const _,
-        Some(transmute::<_, unsafe extern "C" fn()>(
+        Some(transmute::<*const (), unsafe extern "C" fn()>(
           notify_upnp_timeout_trampoline::<F> as *const (),
         )),
         Box_::into_raw(f),

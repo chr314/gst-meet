@@ -1,186 +1,271 @@
-#[cfg(feature = "log-rtp")]
-use anyhow::anyhow;
-use anyhow::{Context, Result};
-use gstreamer::{
-    prelude::{ElementExt as _, ElementExtManual as _, GstBinExt as _},
-    GhostPad,
-};
+use std::sync::Mutex;
+
+#[cfg(not(feature = "log-rtp"))]
+use anyhow::Context;
+use anyhow::Result;
+use gstreamer::{prelude::*, GhostPad};
 use nice_gst_meet as nice;
-use tracing::debug;
-#[cfg(feature = "log-rtp")]
 use tracing::warn;
+use uuid::Uuid;
 
-#[cfg(feature = "log-rtp")]
-use gstreamer_rtp::RTPBuffer;
+use super::{dtls, offer::Fingerprint};
 
-use crate::conference::JitsiConference;
-
-pub(super) fn build_transport_bin(
-  ice_agent: &nice::Agent,
-  ice_stream_id: u32,
-  ice_component_id: u32,
-  dtls_cert_pem: &str,
-  dtls_private_key_pem: &str,
-  conference: &JitsiConference,
-) -> Result<gstreamer::Bin> {
-  // Suppress unused-variable warning when log-rtp feature is disabled.
-  #[cfg(not(feature = "log-rtp"))]
-  let _ = conference;
-
-  let bin = gstreamer::Bin::new();
-
-  let nicesrc = gstreamer::ElementFactory::make("nicesrc")
-    .property("stream", ice_stream_id)
-    .property("component", ice_component_id)
-    .property("agent", ice_agent)
-    .build()?;
-  bin.add(&nicesrc)?;
-
-  let nicesink = gstreamer::ElementFactory::make("nicesink")
-    .property("stream", ice_stream_id)
-    .property("component", ice_component_id)
-    .property("agent", ice_agent)
-    .property("sync", false)
-    .property("async", false)
-    .build()?;
-  bin.add(&nicesink)?;
-
-  let dtls_srtp_connection_id = "gst-meet";
-
-  let dtlssrtpenc = gstreamer::ElementFactory::make("dtlssrtpenc")
-    .property("connection-id", dtls_srtp_connection_id)
-    .property("is-client", true)
-    .build()?;
-  bin.add(&dtlssrtpenc)?;
-
-  let dtlssrtpdec = gstreamer::ElementFactory::make("dtlssrtpdec")
-    .property("connection-id", dtls_srtp_connection_id)
-    .property("pem", format!("{}\n{}", dtls_cert_pem, dtls_private_key_pem))
-    .build()?;
-  bin.add(&dtlssrtpdec)?;
-
-  let rtp_recv_identity = gstreamer::ElementFactory::make("identity").build()?;
-  bin.add(&rtp_recv_identity)?;
-  let rtcp_recv_identity = gstreamer::ElementFactory::make("identity").build()?;
-  bin.add(&rtcp_recv_identity)?;
-  let rtp_send_identity = gstreamer::ElementFactory::make("identity").build()?;
-  bin.add(&rtp_send_identity)?;
-  let rtcp_send_identity = gstreamer::ElementFactory::make("identity").build()?;
-  bin.add(&rtcp_send_identity)?;
-
+pub(super) struct TransportParams<'a> {
+  pub(super) agent: &'a nice::Agent,
+  pub(super) stream_id: u32,
+  pub(super) component_id: u32,
+  pub(super) pem: &'a str,
+  pub(super) is_client: bool,
+  pub(super) peer_fingerprint: Fingerprint,
+  /// Called (once) with the reason when the peer's certificate does not match its fingerprint.
+  pub(super) on_fingerprint_mismatch: Box<dyn Fn(String) + Send + Sync>,
   #[cfg(feature = "log-rtp")]
-  {
-    if conference.config.log_rtp {
-      debug!("setting up RTP packet logging");
+  pub(super) log_rtp: bool,
+  #[cfg(feature = "log-rtp")]
+  pub(super) log_rtcp: bool,
+}
 
-      let make_rtp_logger = |direction: &'static str| {
-        move |values: &[glib::Value]| -> Option<glib::Value> {
-          let f = || {
-            let buffer: gstreamer::Buffer = values[1].get()?;
-            let rtp_buffer = RTPBuffer::from_buffer_readable(&buffer)?;
-            debug!(
-              ssrc = rtp_buffer.ssrc(),
-              pt = rtp_buffer.payload_type(),
-              seq = rtp_buffer.seq(),
-              ts = rtp_buffer.timestamp(),
-              marker = rtp_buffer.is_marker(),
-              extension = rtp_buffer.is_extension(),
-              payload_size = rtp_buffer.payload_size(),
-              "RTP {}",
-              direction,
-            );
-            Ok::<_, anyhow::Error>(())
-          };
-          if let Err(e) = f() {
-            warn!("RTP {}: {:?}", direction, e);
-          }
-          None
-        }
-      };
+/// The two directions are bins of their own: together they make a cycle with rtpbin, which GStreamer warns
+/// about whenever it sorts the elements of the session bin.
+pub(super) struct TransportBins {
+  /// With the ghost pads `rtp_recv_src` and `rtcp_recv_src`.
+  pub(super) receive: gstreamer::Bin,
+  /// With the ghost pads `rtp_send_sink` and `rtcp_send_sink`.
+  pub(super) send: gstreamer::Bin,
+}
 
-      rtp_recv_identity.connect("handoff", false, make_rtp_logger("RECV"));
-      rtp_send_identity.connect("handoff", false, make_rtp_logger("SEND"));
-    }
+pub(super) struct Transport {
+  pub(super) bins: TransportBins,
+  /// Held in `Null` until ICE has connected when we are the DTLS client, so that its ClientHello is not sent
+  /// into a connection that does not exist yet (OpenSSL would only retransmit it seconds later). `None` when we
+  /// are the server. [`EncoderRelease`] lets it go.
+  pub(super) locked_encoder: Option<gstreamer::Element>,
+}
 
-    if conference.config.log_rtcp {
-      debug!("setting up RTCP packet logging");
+enum Held {
+  Encoder(glib::WeakRef<gstreamer::Element>),
+  /// Started, or the session is going away.
+  Done,
+}
 
-      let make_rtcp_logger = |direction: &'static str| {
-        move |values: &[glib::Value]| -> Option<glib::Value> {
-          let f = || {
-            let buffer: gstreamer::Buffer = values[1].get()?;
-            let mut buf = [0u8; 1500];
-            buffer
-              .copy_to_slice(0, &mut buf[..buffer.size()])
-              .map_err(|_| anyhow!("invalid RTCP packet size"))?;
-            let decoded = rtcp::packet::unmarshal(&mut &buf[..buffer.size()])?;
-            debug!("RTCP {} size={}\n{:#?}", direction, buffer.size(), decoded,);
-            Ok::<_, anyhow::Error>(())
-          };
-          if let Err(e) = f() {
-            warn!("RTCP {}: {:?}", direction, e);
-          }
-          None
-        }
-      };
+/// Lets go of the encoder that [`Transport::locked_encoder`] holds back, at most once and never after
+/// [`close`](Self::close).
+///
+/// ICE reports `Connected` on the thread that happens to emit libnice's signals, which is `nicesrc`'s streaming
+/// thread as likely as the agent's main context, so it can run at any moment of the session's teardown. Taking
+/// the bin apart must not interleave with it: `sync_state_with_parent` reads the state of the parent and then
+/// sets the encoder's, and setting `Playing` after the bin went to `Null` leaves a running element in a bin that
+/// is no longer part of anything. Hence both go through one lock, and whatever teardown does comes after `close`.
+pub(super) struct EncoderRelease {
+  held: Mutex<Held>,
+}
 
-      rtcp_recv_identity.connect("handoff", false, make_rtcp_logger("RECV"));
-      rtcp_send_identity.connect("handoff", false, make_rtcp_logger("SEND"));
+impl EncoderRelease {
+  pub(super) fn new(encoder: &gstreamer::Element) -> Self {
+    Self {
+      held: Mutex::new(Held::Encoder(encoder.downgrade())),
     }
   }
 
-  // Internal element linking
-  debug!("link dtlssrtpdec -> identity elements");
-  dtlssrtpdec.link_pads(Some("rtp_src"), &rtp_recv_identity, None)?;
-  dtlssrtpdec.link_pads(Some("rtcp_src"), &rtcp_recv_identity, None)?;
+  pub(super) fn release(&self) {
+    let mut held = self.held.lock().unwrap_or_else(|e| e.into_inner());
+    let Held::Encoder(encoder) = &*held else {
+      return;
+    };
+    if let Some(encoder) = encoder.upgrade() {
+      encoder.set_locked_state(false);
+      if let Err(e) = encoder.sync_state_with_parent() {
+        warn!("failed to start the DTLS encoder: {:?}", e);
+      }
+    }
+    *held = Held::Done;
+  }
 
-  debug!("linking identity elements -> dtlssrtpenc");
-  rtp_send_identity.link_pads(None, &dtlssrtpenc, Some("rtp_sink_0"))?;
-  rtcp_send_identity.link_pads(None, &dtlssrtpenc, Some("rtcp_sink_0"))?;
+  /// Returns once a [`release`](Self::release) that was running has finished; none starts the encoder after.
+  pub(super) fn close(&self) {
+    *self.held.lock().unwrap_or_else(|e| e.into_inner()) = Held::Done;
+  }
+}
 
-  debug!("linking ice src -> dtlssrtpdec");
+pub(super) fn build_transport_bin(params: TransportParams) -> Result<Transport> {
+  let nicesrc = gstreamer::ElementFactory::make("nicesrc")
+    .property("stream", params.stream_id)
+    .property("component", params.component_id)
+    .property("agent", params.agent)
+    .build()?;
+  let nicesink = gstreamer::ElementFactory::make("nicesink")
+    .property("stream", params.stream_id)
+    .property("component", params.component_id)
+    .property("agent", params.agent)
+    .property("sync", false)
+    .property("async", false)
+    .build()?;
+
+  // Encoder and decoder are paired by this id, which must be unique among all DTLS connections of the process.
+  let connection_id = Uuid::new_v4().to_string();
+  let dtlssrtpenc = gstreamer::ElementFactory::make("dtlssrtpenc")
+    .property("connection-id", &connection_id)
+    .property("is-client", params.is_client)
+    .build()?;
+  let dtlssrtpdec = gstreamer::ElementFactory::make("dtlssrtpdec")
+    .property("connection-id", &connection_id)
+    .property("pem", params.pem)
+    .build()?;
+  let (receive, send) = (gstreamer::Bin::new(), gstreamer::Bin::new());
+  receive.add_many([&nicesrc, &dtlssrtpdec])?;
+  send.add_many([&dtlssrtpenc, &nicesink])?;
+
+  let gate = dtls::gate_decoder(&dtlssrtpdec, params.peer_fingerprint, params.on_fingerprint_mismatch)?;
+
+  let locked_encoder = params.is_client.then(|| {
+    dtlssrtpenc.set_locked_state(true);
+    dtlssrtpenc.clone()
+  });
+
+  #[cfg(feature = "log-rtp")]
+  let (rtp_recv_src, rtcp_recv_src, rtp_send_sink, rtcp_send_sink) = logging::link_loggers(
+    &receive,
+    &send,
+    &dtlssrtpdec,
+    &dtlssrtpenc,
+    params.log_rtp,
+    params.log_rtcp,
+  )?;
+
+  #[cfg(not(feature = "log-rtp"))]
+  let (rtp_recv_src, rtcp_recv_src, rtp_send_sink, rtcp_send_sink) = (
+    dtlssrtpdec
+      .static_pad("rtp_src")
+      .context("dtlssrtpdec has no rtp_src pad")?,
+    dtlssrtpdec
+      .static_pad("rtcp_src")
+      .context("dtlssrtpdec has no rtcp_src pad")?,
+    dtlssrtpenc
+      .request_pad_simple("rtp_sink_0")
+      .context("dtlssrtpenc refused to create rtp_sink_0")?,
+    dtlssrtpenc
+      .request_pad_simple("rtcp_sink_0")
+      .context("dtlssrtpenc refused to create rtcp_sink_0")?,
+  );
+
   nicesrc.link(&dtlssrtpdec)?;
-
-  debug!("linking dtlssrtpenc -> ice sink");
   dtlssrtpenc.link_pads(Some("src"), &nicesink, Some("sink"))?;
+  // The keys exist as soon as the handshake is through, whoever the peer turns out to be.
+  gate.gate_encoder_sink(&dtlssrtpenc, "rtp_sink_0")?;
+  gate.gate_encoder_sink(&dtlssrtpenc, "rtcp_sink_0")?;
 
-  // Expose ghost pads for connections to/from rtpbin
-  bin.add_pad(
-    &GhostPad::builder_with_target(
-      &rtp_recv_identity
-        .static_pad("src")
-        .context("rtp_recv_identity has no src pad")?,
-    )?
-    .name("rtp_recv_src")
-    .build(),
-  )?;
-  bin.add_pad(
-    &GhostPad::builder_with_target(
-      &rtcp_recv_identity
-        .static_pad("src")
-        .context("rtcp_recv_identity has no src pad")?,
-    )?
-    .name("rtcp_recv_src")
-    .build(),
-  )?;
-  bin.add_pad(
-    &GhostPad::builder_with_target(
-      &rtp_send_identity
-        .static_pad("sink")
-        .context("rtp_send_identity has no sink pad")?,
-    )?
-    .name("rtp_send_sink")
-    .build(),
-  )?;
-  bin.add_pad(
-    &GhostPad::builder_with_target(
-      &rtcp_send_identity
-        .static_pad("sink")
-        .context("rtcp_send_identity has no sink pad")?,
-    )?
-    .name("rtcp_send_sink")
-    .build(),
-  )?;
+  for (bin, name, target) in [
+    (&receive, "rtp_recv_src", &rtp_recv_src),
+    (&receive, "rtcp_recv_src", &rtcp_recv_src),
+    (&send, "rtp_send_sink", &rtp_send_sink),
+    (&send, "rtcp_send_sink", &rtcp_send_sink),
+  ] {
+    bin.add_pad(&GhostPad::builder_with_target(target)?.name(name).build())?;
+  }
 
-  Ok(bin)
+  Ok(Transport {
+    bins: TransportBins { receive, send },
+    locked_encoder,
+  })
+}
+
+#[cfg(feature = "log-rtp")]
+mod logging {
+  use anyhow::{anyhow, Context, Result};
+  use gstreamer::prelude::*;
+  use gstreamer_rtp::RTPBuffer;
+  use tracing::{debug, warn};
+
+  type Pads = (gstreamer::Pad, gstreamer::Pad, gstreamer::Pad, gstreamer::Pad);
+
+  /// Puts an `identity` between the DTLS elements and rtpbin on each of the four paths, and logs the packets
+  /// that pass if asked to.
+  pub(super) fn link_loggers(
+    receive: &gstreamer::Bin,
+    send: &gstreamer::Bin,
+    dtlssrtpdec: &gstreamer::Element,
+    dtlssrtpenc: &gstreamer::Element,
+    log_rtp: bool,
+    log_rtcp: bool,
+  ) -> Result<Pads> {
+    let identity = || gstreamer::ElementFactory::make("identity").build();
+    let rtp_recv = identity()?;
+    let rtcp_recv = identity()?;
+    let rtp_send = identity()?;
+    let rtcp_send = identity()?;
+    receive.add_many([&rtp_recv, &rtcp_recv])?;
+    send.add_many([&rtp_send, &rtcp_send])?;
+
+    if log_rtp {
+      debug!("setting up RTP packet logging");
+      rtp_recv.connect("handoff", false, rtp_logger("RECV"));
+      rtp_send.connect("handoff", false, rtp_logger("SEND"));
+    }
+    if log_rtcp {
+      debug!("setting up RTCP packet logging");
+      rtcp_recv.connect("handoff", false, rtcp_logger("RECV"));
+      rtcp_send.connect("handoff", false, rtcp_logger("SEND"));
+    }
+
+    dtlssrtpdec.link_pads(Some("rtp_src"), &rtp_recv, None)?;
+    dtlssrtpdec.link_pads(Some("rtcp_src"), &rtcp_recv, None)?;
+    rtp_send.link_pads(None, dtlssrtpenc, Some("rtp_sink_0"))?;
+    rtcp_send.link_pads(None, dtlssrtpenc, Some("rtcp_sink_0"))?;
+
+    let pad = |element: &gstreamer::Element, name: &str| {
+      element
+        .static_pad(name)
+        .with_context(|| format!("{} has no {} pad", element.name(), name))
+    };
+    Ok((
+      pad(&rtp_recv, "src")?,
+      pad(&rtcp_recv, "src")?,
+      pad(&rtp_send, "sink")?,
+      pad(&rtcp_send, "sink")?,
+    ))
+  }
+
+  fn rtp_logger(direction: &'static str) -> impl Fn(&[glib::Value]) -> Option<glib::Value> + Send + Sync + 'static {
+    move |values| {
+      let f = || {
+        let buffer: gstreamer::Buffer = values[1].get()?;
+        let rtp_buffer = RTPBuffer::from_buffer_readable(&buffer)?;
+        debug!(
+          ssrc = rtp_buffer.ssrc(),
+          pt = rtp_buffer.payload_type(),
+          seq = rtp_buffer.seq(),
+          ts = rtp_buffer.timestamp(),
+          marker = rtp_buffer.is_marker(),
+          extension = rtp_buffer.is_extension(),
+          payload_size = rtp_buffer.payload_size(),
+          "RTP {}",
+          direction,
+        );
+        Ok::<_, anyhow::Error>(())
+      };
+      if let Err(e) = f() {
+        warn!("RTP {}: {:?}", direction, e);
+      }
+      None
+    }
+  }
+
+  fn rtcp_logger(direction: &'static str) -> impl Fn(&[glib::Value]) -> Option<glib::Value> + Send + Sync + 'static {
+    move |values| {
+      let f = || {
+        let buffer: gstreamer::Buffer = values[1].get()?;
+        let mut buf = [0u8; 1500];
+        buffer
+          .copy_to_slice(0, &mut buf[..buffer.size()])
+          .map_err(|_| anyhow!("invalid RTCP packet size"))?;
+        let decoded = rtcp::packet::unmarshal(&mut &buf[..buffer.size()])?;
+        debug!("RTCP {} size={}\n{:#?}", direction, buffer.size(), decoded,);
+        Ok::<_, anyhow::Error>(())
+      };
+      if let Err(e) = f() {
+        warn!("RTCP {}: {:?}", direction, e);
+      }
+      None
+    }
+  }
 }

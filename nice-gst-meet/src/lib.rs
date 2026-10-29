@@ -16,6 +16,9 @@ pub use self::enums::{
 mod flags;
 use nice_sys as ffi;
 
+#[cfg(all(test, feature = "v0_1_18"))]
+mod tests;
+
 #[cfg(any(feature = "v0_1_15", feature = "dox"))]
 #[cfg_attr(feature = "dox", doc(cfg(feature = "v0_1_15")))]
 pub use self::flags::AgentOption;

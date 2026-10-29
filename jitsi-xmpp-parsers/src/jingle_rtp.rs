@@ -1,11 +1,29 @@
+use minidom::Element;
 use xmpp_parsers::{
-  jingle_rtcp_fb::RtcpFb,
-  jingle_rtp::{PayloadType, RtcpMux},
+  jingle_rtp::PayloadType,
   jingle_rtp_hdrext::RtpHdrext,
   ns::{JINGLE_RTP, JINGLE_RTP_HDREXT, JINGLE_SSMA},
 };
 
 use crate::jingle_ssma::{Group, Source};
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct RtcpMux;
+
+impl TryFrom<Element> for RtcpMux {
+  type Error = xmpp_parsers::Error;
+
+  fn try_from(root: Element) -> Result<RtcpMux, xmpp_parsers::Error> {
+    check_self!(root, "rtcp-mux", JINGLE_RTP, "RtcpMux");
+    Ok(RtcpMux)
+  }
+}
+
+impl From<RtcpMux> for Element {
+  fn from(_: RtcpMux) -> Element {
+    Element::builder("rtcp-mux", JINGLE_RTP).build()
+  }
+}
 
 generate_element!(
   /// Wrapper element describing an RTP session.

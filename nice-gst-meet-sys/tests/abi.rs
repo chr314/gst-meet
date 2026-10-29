@@ -43,7 +43,7 @@ impl Compiler {
     cmd.arg(out);
     let status = cmd.spawn()?.wait()?;
     if !status.success() {
-      return Err(format!("compilation command {:?} failed, {}", &cmd, status).into());
+      return Err(format!("compilation command {:?} failed, {}", cmd, status).into());
     }
     Ok(())
   }
@@ -73,7 +73,7 @@ fn pkg_config_cflags(packages: &[&str]) -> Result<Vec<String>, Box<dyn Error>> {
   cmd.args(packages);
   let out = cmd.output()?;
   if !out.status.success() {
-    return Err(format!("command {:?} returned {}", &cmd, out.status).into());
+    return Err(format!("command {:?} returned {}", cmd, out.status).into());
   }
   let stdout = str::from_utf8(&out.stdout)?;
   Ok(shell_words::split(stdout.trim())?)
@@ -144,7 +144,7 @@ fn cross_validate_constants_with_c() {
       results.record_failed();
       eprintln!(
         "Constant value mismatch for {}\nRust: {:?}\nC:    {:?}",
-        rust_name, rust_value, &c_value
+        rust_name, rust_value, c_value
       );
       continue;
     }
@@ -186,7 +186,7 @@ fn cross_validate_layout_with_c() {
       results.record_failed();
       eprintln!(
         "Layout mismatch for {}\nRust: {:?}\nC:    {:?}",
-        rust_name, rust_layout, &c_layout
+        rust_name, rust_layout, c_layout
       );
       continue;
     }
@@ -208,7 +208,7 @@ fn get_c_output(name: &str) -> Result<String, Box<dyn Error>> {
   let mut abi_cmd = Command::new(exe);
   let output = abi_cmd.output()?;
   if !output.status.success() {
-    return Err(format!("command {:?} failed, {:?}", &abi_cmd, &output).into());
+    return Err(format!("command {:?} failed, {:?}", abi_cmd, output).into());
   }
 
   Ok(String::from_utf8(output.stdout)?)

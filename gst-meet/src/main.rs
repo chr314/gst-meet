@@ -1,9 +1,9 @@
-use std::{collections::HashMap, time::Duration};
+use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use anyhow::{bail, Context, Result};
 #[cfg(target_os = "macos")]
 use cocoa::appkit::NSApplication;
-use colibri::{ColibriMessage, VideoType};
+use colibri::VideoType;
 use glib::object::ObjectExt as _;
 use gstreamer::{
   prelude::{ElementExt as _, ElementExtManual as _, GstBinExt as _},
@@ -11,10 +11,12 @@ use gstreamer::{
 };
 use http::Uri;
 use lib_gst_meet::{
-  init_tracing, Authentication, Connection, JitsiConferenceConfig, MediaType,
+  init_tracing, Authentication, Connection, JitsiConferenceConfig, JoinError, MediaType,
 };
 use structopt::StructOpt;
-use tokio::{signal::ctrl_c, task, time::timeout};
+use tokio::{signal::ctrl_c, sync::Notify, time::timeout};
+#[cfg(target_os = "macos")]
+use tracing::error;
 use tracing::{info, trace, warn};
 
 #[derive(Debug, Clone, StructOpt)]
@@ -86,9 +88,15 @@ struct Opt {
 
   #[structopt(
     long,
-    help = "Comma-separated endpoint IDs to select (prioritise receiving of)"
+    help = "Comma-separated endpoint IDs to select (prioritise receiving of the video of)"
   )]
   select_endpoints: Option<String>,
+
+  #[structopt(
+    long,
+    help = "Comma-separated source names to select (prioritise receiving of), such as abcd1234-v0"
+  )]
+  select_sources: Option<String>,
 
   #[structopt(
     long,
@@ -334,11 +342,18 @@ async fn main_inner() -> Result<()> {
     b.build()
   };
 
-  let main_loop = glib::MainLoop::new(None, false);
-
   let conference = lib_gst_meet::JitsiConference::join(connection, config)
     .await
-    .context("failed to join conference")?;
+    .map_err(|e| {
+      match e.downcast_ref::<JoinError>() {
+        Some(JoinError::AuthenticationRequired) => {
+          warn!("This deployment requires authentication: use --xmpp-username and --xmpp-password, or --xmpp-jwt")
+        },
+        Some(JoinError::PasswordRequired) => warn!("The room is protected by a password"),
+        _ => {},
+      }
+      e.context("failed to join conference")
+    })?;
 
   conference
     .set_last_n(opt.last_n.map(i32::from).unwrap_or(-1))
@@ -346,20 +361,28 @@ async fn main_inner() -> Result<()> {
   conference
     .set_max_receive_height(opt.recv_video_scale_height)
     .await?;
-  if let Some(endpoints) = opt.select_endpoints {
-    conference
-      .set_selected_endpoints(endpoints.split(',').map(ToOwned::to_owned).collect())
-      .await?;
+  // The video of an endpoint is the source `<endpoint id>-v0`.
+  let selected_sources: Vec<String> = opt
+    .select_endpoints
+    .iter()
+    .flat_map(|endpoints| endpoints.split(',').map(|endpoint| format!("{endpoint}-v0")))
+    .chain(
+      opt
+        .select_sources
+        .iter()
+        .flat_map(|sources| sources.split(',').map(ToOwned::to_owned)),
+    )
+    .collect();
+  if !selected_sources.is_empty() {
+    conference.set_selected_sources(selected_sources).await?;
   }
 
   if let Some(video_type) = opt.video_type {
     conference
-      .send_colibri_message(ColibriMessage::VideoTypeMessage {
-        video_type: match video_type.as_str() {
-          "camera" => VideoType::Camera,
-          "desktop" => VideoType::Desktop,
-          other => bail!(format!("invalid video type: {}", other)),
-        },
+      .set_video_type(match video_type.as_str() {
+        "camera" => VideoType::Camera,
+        "desktop" => VideoType::Desktop,
+        other => bail!(format!("invalid video type: {}", other)),
       })
       .await?;
   }
@@ -502,26 +525,29 @@ async fn main_inner() -> Result<()> {
     .set_pipeline_state(gstreamer::State::Playing)
     .await?;
 
+  let finished = Arc::new(Notify::new());
+
   let conference_ = conference.clone();
-  let main_loop_ = main_loop.clone();
-  conference.on_conference_left(move || {
+  let finished_ = finished.clone();
+  conference
+    .on_conference_left(move |reason| {
       let conference_ = conference_.clone();
-      let main_loop_ = main_loop_.clone();
+      let finished_ = finished_.clone();
       Box::pin(async move {
-        info!("Conference ended by remote — leaving...");
+        info!("Conference left: {:?}", reason);
         match timeout(Duration::from_secs(10), conference_.leave()).await {
           Ok(Ok(_)) => {},
           Ok(Err(e)) => warn!("Error leaving conference: {:?}", e),
           Err(_) => warn!("Timed out leaving conference"),
         }
-        main_loop_.quit();
+        finished_.notify_one();
         Ok(())
       })
     })
     .await;
 
   let conference_ = conference.clone();
-  let main_loop_ = main_loop.clone();
+  let finished_ = finished.clone();
   tokio::spawn(async move {
     ctrl_c().await.unwrap();
 
@@ -533,10 +559,10 @@ async fn main_inner() -> Result<()> {
       Err(_) => warn!("Timed out leaving conference"),
     }
 
-    main_loop_.quit();
+    finished_.notify_one();
   });
 
-  task::spawn_blocking(move || main_loop.run()).await?;
+  finished.notified().await;
 
   Ok(())
 }

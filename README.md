@@ -50,6 +50,33 @@ For nix users, a `shell.nix` is provided. Within the repository, run `nix-shell 
 
 To integrate gst-meet into your own application, add a Cargo dependency on `lib-gst-meet`.
 
+`JitsiConference::join` resolves once the focus has accepted the first media session. A join that cannot succeed (yet) fails with a `JoinError` inside the returned `anyhow::Error` (`error.downcast_ref::<JoinError>()`): for example `AuthenticationRequired` or `MembersOnly { waiting_for_host: true, .. }` while nobody has opened the room, `PasswordRequired`, `RoomFull`, `Timeout`. The library does not need the application to run a GLib main loop: unless `JitsiConferenceConfig::glib_main_context` is set, it runs libnice on a context and thread of its own.
+
+The conference has one GStreamer pipeline for its whole lifetime (`JitsiConference::pipeline`), playing from the first media session on. Each Jingle session with the bridge lives in a bin of its own inside it. When Jicofo moves the participant to another bridge, or ICE or DTLS fail and the library asks Jicofo for a new session, the session's streams end and new ones start in the same pipeline, with the running time continuing; `JitsiConference::on_media_session` reports these. `on_conference_left` fires once, with the reason, when the conference is over: left, kicked, room destroyed, connection lost, no new media session within `media_session_timeout`, or a fatal error.
+
+All callbacks run one at a time, in order, on a task of the library, never while it holds a lock, so they may call back into the conference. The sink factory (`set_stream_sink_factory`) and `on_sync_sample` are the exceptions: they are called synchronously from the library's threads and must not call into the conference.
+
+### Remote streams
+
+Every remote source that is signalled for a participant and receives packets becomes a stream with a `StreamId` that is never reused. The sink factory gets a `StreamInfo` (stream id, participant, SSRC, media type, source name) and returns the element that receives the stream; `on_remote_stream` then gets `Added`, and `Removed` once the stream is gone. A `Removed` with `error` set and no preceding `Added` means the stream could not be activated after the factory had been called, so the element it returned can be dropped.
+
+* A source that is removed and added again (a camera switched off and on) becomes a new stream.
+* A change of codec or payload type on the same SSRC keeps the stream and its sink, which sees new caps.
+* An error from a single stream's elements (its depayloading/decoding chain or its per-stream sink) ends only that stream with `Removed { error }`; nothing a stream's elements do can stop the reception of the others.
+* A per-stream sink gets EOS when its stream ends, and `Removed` fires after the EOS has reached its sink elements, so that for example a muxer can finalize its file. `JitsiConference::drain_streams` does this for all streams at once and returns an error if some did not drain in time.
+
+`JitsiConference::remote_sources` and `on_source` give the signalled sources with their names and video types. `set_video_receive_policy` sets the bridge's receiver video constraints per source from its video type (camera or screen share) and keeps them up to date as sources come and go; `set_receiver_video_constraints`, `set_last_n`, `set_selected_sources` and `set_on_stage_sources` set them directly. The library keeps these constraints and sends them again whenever the bridge channel reconnects or a new session starts.
+
+### Receiving media as received (`ReceiveMode::Encoded`)
+
+By default (`ReceiveMode::Decoded`) every remote stream is depayloaded, decoded and, for video, scaled and converted before it reaches its sink. With `JitsiConferenceConfig::receive_mode` set to `ReceiveMode::Encoded`, nothing is decoded: each stream is depayloaded and parsed only (`audio/x-opus`, `video/x-vp8`, `video/x-vp9` as super-frames, `video/x-h264` as `avc`/`au`, `video/x-av1` as `obu-stream`/`tu`), passes through queues that never drop, and is handed to the sink as it was received. This is meant for writing the tracks to disk. In this mode:
+
+* Packet loss, including the loss of whole frames, makes the depayloader wait for the next keyframe and request one from the sender; a keyframe is also requested when a stream starts.
+* VP9 with spatial layers (as Chrome sends it by default) gets a superframe index, so the stored stream decodes in libvpx and FFmpeg alike.
+* `JitsiConference::on_sync_sample` delivers RTCP sender reports and (RTP timestamp, running time) pairs per stream, once per second, for aligning the tracks later.
+
+The codecs advertised to other participants are those of `JitsiConferenceConfig::video_codecs` that the local GStreamer installation can actually receive in the configured mode (AV1 needs `rtpav1depay` from gst-plugins-rs and `av1parse`).
+
 ## Usage
 
 You can pass GStreamer pipeline fragments to the `gst-meet` tool.

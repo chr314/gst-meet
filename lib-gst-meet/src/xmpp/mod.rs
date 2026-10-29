@@ -1,4 +1,5 @@
 pub mod connection;
 pub(crate) mod extdisco;
+pub(crate) mod iq;
 pub(crate) mod jitsi;
-mod ns;
+pub(crate) mod ns;

@@ -1,7 +1,18 @@
 use minidom::{Element, NSChoice::Any};
-use xmpp_parsers::{jingle_ssma::Semantics, ns::JINGLE_SSMA};
+use xmpp_parsers::ns::JINGLE_SSMA;
 
 use crate::ns::JITSI_MEET;
+
+generate_attribute!(
+  /// SSRC-group semantics as used by Jitsi (subset of RFC 5888 + SIM).
+  Semantics, "semantics", {
+    /// Flow Identification (RFC 5888). Used to bind RTX to its primary SSRC.
+    Fid => "FID",
+
+    /// Simulcast: primary SSRCs of a single source's simulcast layers.
+    Sim => "SIM",
+  }
+);
 
 generate_element!(
   /// Source element for the ssrc SDP attribute.

@@ -21,7 +21,7 @@ tokio-stream = { version = "0.1", default-features = false }
 tracing = { version = "0.1", default-features = false, features = ["attributes", "std"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
-cocoa = { version = "0.25", default-features = false }
+cocoa = { version = "0.27", default-features = false }
 
 [features]
 default = ["tls-rustls-native-roots"]
