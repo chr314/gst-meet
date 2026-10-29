@@ -40,7 +40,7 @@ impl SendPath {
     let audio = gstreamer::ElementFactory::make(opus.payloader_name()).build()?;
     audio.set_property("pt", opus.pt as u32);
     audio.set_property("min-ptime", 10i64 * 1000 * 1000);
-    audio.set_property("ssrc", ssrcs.audio);
+    set_ssrc(&audio, ssrcs.audio);
     configure_header_extensions(&audio, "audio payloader");
 
     let video = gstreamer::ElementFactory::make(video_codec.payloader_name()).build()?;
@@ -50,7 +50,7 @@ impl SendPath {
       CodecName::Vp8 | CodecName::Vp9 => video.set_property_from_str("picture-id-mode", "15-bit"),
       CodecName::Opus | CodecName::Av1 => {},
     }
-    video.set_property("ssrc", ssrcs.video);
+    set_ssrc(&video, ssrcs.video);
     configure_header_extensions(&video, "video payloader");
 
     let funnel = gstreamer::ElementFactory::make("rtpfunnel").build()?;
@@ -126,6 +126,19 @@ impl SendPath {
         let _ = src.unlink(session_sink);
       }
     }
+  }
+}
+
+// The payloaders of gst-plugins-rs declare it as an i64, with -1 for random.
+fn set_ssrc(payloader: &gstreamer::Element, ssrc: u32) {
+  if payloader
+    .find_property("ssrc")
+    .is_some_and(|pspec| pspec.value_type() == i64::static_type())
+  {
+    payloader.set_property("ssrc", i64::from(ssrc));
+  }
+  else {
+    payloader.set_property("ssrc", ssrc);
   }
 }
 
