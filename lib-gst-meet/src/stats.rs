@@ -85,7 +85,7 @@ pub(crate) fn endpoint_stats(source_stats: &[Structure], context: &StatsContext)
       upload: 0, // TODO
     },
     connection_quality: 100.0,
-    jvb_rtt: Some(0), // TODO
+    jvb_rtt: Some(0.0), // TODO
     server_region: region.map(ToOwned::to_owned),
     max_enabled_resolution: *max_enabled_resolution,
   }

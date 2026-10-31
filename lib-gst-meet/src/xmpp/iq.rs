@@ -9,7 +9,7 @@ use xmpp_parsers::{
 };
 
 #[derive(Debug, Clone)]
-pub(crate) enum IqResponse {
+pub enum IqResponse {
   Result(Option<Element>),
   Error(Element),
 }
@@ -37,7 +37,7 @@ impl IqResponse {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum RequestError {
+pub enum RequestError {
   ConnectionClosed,
   Timeout,
 }

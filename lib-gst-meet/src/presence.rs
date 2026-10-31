@@ -89,11 +89,17 @@ impl PresenceState {
           .build(),
       ]);
     }
-    payloads.extend(self.extra_features.iter().map(|var| {
-      Element::builder("feature", ns::DISCO_INFO)
-        .attr(::minidom::rxml::xml_ncname!("var").to_owned(), var.as_str())
-        .build()
-    }));
+    if !self.extra_features.is_empty() {
+      payloads.push(
+        Element::builder("features", ns::DEFAULT_NS)
+          .append_all(self.extra_features.iter().map(|var| {
+            Element::builder("feature", ns::DEFAULT_NS)
+              .attr(::minidom::rxml::xml_ncname!("var").to_owned(), var.as_str())
+              .build()
+          }))
+          .build(),
+      );
+    }
     payloads
   }
 }
@@ -131,7 +137,26 @@ mod tests {
     assert_eq!(text_of(&payloads, "jitsi_participant_codecList"), "vp9,vp8");
     assert_eq!(text_of(&payloads, "nick"), "Recorder");
     assert_eq!(text_of(&payloads, "jitsi_participant_region"), "eu");
-    assert!(payloads.iter().any(|payload| payload.name() == "feature"));
+  }
+
+  #[test]
+  fn extra_features_are_wrapped_in_features() {
+    let payloads = state().payloads(false);
+    let features = payloads.iter().find(|payload| payload.is("features", ns::DEFAULT_NS)).unwrap();
+    let vars: Vec<_> = features
+      .children()
+      .filter(|child| child.is("feature", ns::DEFAULT_NS))
+      .filter_map(|child| child.attr("var"))
+      .collect();
+    assert_eq!(vars, ["urn:example:feature"]);
+    assert!(!payloads.iter().any(|payload| payload.name() == "feature"));
+  }
+
+  #[test]
+  fn no_features_element_without_extra_features() {
+    let mut state = state();
+    state.extra_features.clear();
+    assert!(!state.payloads(false).iter().any(|payload| payload.name() == "features"));
   }
 
   #[test]

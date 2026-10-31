@@ -37,7 +37,7 @@ pub enum ColibriMessage {
     packet_loss: PacketLoss,
     connection_quality: f32,
     #[serde(rename = "jvbRTT")]
-    jvb_rtt: Option<i32>,
+    jvb_rtt: Option<f64>,
     server_region: Option<String>,
     max_enabled_resolution: Option<i32>,
   },
@@ -396,12 +396,12 @@ mod tests {
         upload: 0,
       },
       connection_quality: 100.0,
-      jvb_rtt: Some(12),
+      jvb_rtt: Some(12.5),
       server_region: None,
       max_enabled_resolution: Some(720),
     };
     let value = serde_json::to_value(&stats).unwrap();
-    assert_eq!(value["jvbRTT"], 12);
+    assert_eq!(value["jvbRTT"], 12.5);
     assert_eq!(value["bitrate"]["upload"], 4);
     assert_eq!(serde_json::from_value::<ColibriMessage>(value).unwrap(), stats);
   }

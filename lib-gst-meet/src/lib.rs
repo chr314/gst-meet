@@ -37,7 +37,10 @@ pub use crate::{
   receiver::VideoReceivePolicy,
   source::{MediaType, RemoteSource},
   stanza_filter::{StanzaFilter, StanzaFilterId},
-  xmpp::connection::{Authentication, Connection},
+  xmpp::{
+    connection::{Authentication, Connection},
+    iq::{IqResponse, RequestError},
+  },
 };
 
 #[cfg(feature = "tracing-subscriber")]

@@ -277,6 +277,13 @@ impl Connection {
     let _ = self.tx.send(Element::builder("close", ns::WEBSOCKET).build()).await;
   }
 
+  pub async fn send(&self, element: Element) -> Result<(), RequestError> {
+    if self.inner.lock().await.closed.is_some() {
+      return Err(RequestError::ConnectionClosed);
+    }
+    self.tx.send(element).await.map_err(|_| RequestError::ConnectionClosed)
+  }
+
   /// Sets the connection up: authenticates and binds a resource. It fails with a [`ConnectionError`] as soon as the
   /// server refuses a step or the connection ends, and when the server takes longer than 30 seconds.
   pub async fn connect(&self) -> Result<()> {
@@ -402,7 +409,7 @@ impl Connection {
     }
   }
 
-  pub(crate) async fn request(&self, iq: Iq, timeout_after: Duration) -> Result<IqResponse, RequestError> {
+  pub async fn request(&self, iq: Iq, timeout_after: Duration) -> Result<IqResponse, RequestError> {
     self.send_request(iq).await?.wait(timeout_after).await
   }
 
