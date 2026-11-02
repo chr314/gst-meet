@@ -472,11 +472,6 @@ impl Shared {
     self.sync_sample_sink.set(callback);
   }
 
-  /// Whether the focus still has the Jingle session `sid` with us, as far as the stanza filter knows.
-  pub(crate) fn session_is_known(&self, sid: &str) -> bool {
-    self.lock().known_sid.as_deref() == Some(sid)
-  }
-
   /// A Jingle session is over: the focus has ended it or we are ending it. Forgets `sid` as the session the focus has
   /// with us, unless it is another one by now (a session the focus has offered since). Returns whether `sid` was the
   /// session it knew.

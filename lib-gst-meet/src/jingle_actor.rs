@@ -88,8 +88,6 @@ pub(crate) enum Command {
 pub(crate) enum Purpose {
   /// A session-terminate that asks for a new session.
   Restart,
-  /// The session-info that tells the focus ICE failed, which it answers with a new session.
-  IceFailed,
   Other(&'static str),
 }
 
@@ -525,22 +523,10 @@ impl Actor {
   async fn session_failed(&mut self, failure: SessionFailure) {
     warn!("the media session failed: {:?}", failure);
     match failure {
-      SessionFailure::Ice => {
-        if !self.restarts.allow(Instant::now()) {
-          return self.give_up_after_restarts("ICE failed").await;
-        }
-        // Jicofo answers with a new session, by whichever way it is set to re-invite. If it has ended the session
-        // already, it does not want to hear about it.
-        let reference = self
-          .reference
-          .as_ref()
-          .filter(|reference| self.shared.session_is_known(&reference.sid));
-        if let Some(reference) = reference {
-          self.send_watched(jingle::ice_failed(reference), Purpose::IceFailed).await;
-        }
-        self.end_session("ICE failed", true).await;
-        self.expect_session();
-      },
+      // Not the session-info with <ice-state>failed</ice-state>: Jicofo answers that by allocating on the bridge
+      // without releasing our endpoint first, which fails with "participant already exists" and leaves us without
+      // media. A restart request releases it.
+      SessionFailure::Ice => self.restart(Reason::ConnectivityError, "ICE failed".to_owned()).await,
       SessionFailure::Dtls(message) | SessionFailure::Transport(message) => {
         self.restart(Reason::ConnectivityError, message).await;
       },

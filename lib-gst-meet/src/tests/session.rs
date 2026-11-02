@@ -79,51 +79,21 @@ async fn a_reinvite_in_time_keeps_the_conference() {
 }
 
 #[tokio::test]
-async fn failed_ice_is_reported_to_the_focus_which_starts_a_new_session() {
+async fn failed_ice_ends_the_session_and_asks_for_a_new_one() {
   let mut harness = Harness::join().await;
   harness.record_events().await;
   (harness.media.hooks.session_failed)(1, SessionFailure::Ice);
 
-  let info = harness.server.jingle("session-info").await;
-  assert_eq!(info.attr("to"), Some(FOCUS));
-  assert_eq!(
-    text(info.get_child("jingle", ns::JINGLE).unwrap()),
-    "<jingle xmlns='urn:xmpp:jingle:1' action='session-info' initiator='focus@auth.meet.example/focus' sid='sid-1'>\
-     <ice-state xmlns='http://jitsi.org/protocol/focus'>failed</ice-state>\
-     <bridge-session xmlns='http://jitsi.org/protocol/focus' id='bridge-1'/></jingle>"
-  );
+  let xml = text(&harness.server.jingle("session-terminate").await);
+  assert!(xml.contains("<connectivity-error"), "{xml}");
+  assert!(xml.contains("ICE failed"), "{xml}");
+  assert!(xml.contains("<bridge-session xmlns='http://jitsi.org/protocol/focus' id='bridge-1' restart='true'/>"), "{xml}");
+  assert!(!xml.contains("ice-state"), "{xml}");
   harness.media.wait_for_log("session 1: shutdown").await;
   harness.events.wait_for("session ended restarting=true").await;
 
-  // Jicofo ends the old session and invites us again.
-  harness
-    .server
-    .receive(&jingle("terminate-1", FOCUS, "session-terminate", "sid-1", "<reason><success/></reason>"))
-    .await;
-  harness.server.expect_ack("terminate-1").await;
   harness.server.offer_session("initiate-2", &offer_with("sid-2", &[("bob", 2000)])).await;
   harness.media.wait_for_log("session 2: start sid=sid-2 sources=[1000, 2000] ice_servers=1 fingerprint=Sha256 candidates=1").await;
-}
-
-#[tokio::test]
-async fn failed_ice_is_also_followed_by_a_transport_replace() {
-  let mut harness = Harness::join().await;
-  (harness.media.hooks.session_failed)(1, SessionFailure::Ice);
-  harness.server.jingle("session-info").await;
-  harness.media.wait_for_log("session 1: shutdown").await;
-
-  harness
-    .server
-    .receive(&transport_replace("replace-1", &offer_with("sid-1", &[("bob", 2000)])))
-    .await;
-  harness.server.expect_ack("replace-1").await;
-  let accept = harness.server.jingle("transport-accept").await;
-  harness.server.answer(&accept).await;
-  harness.media.wait_for_log("session 2: start sid=sid-1 sources=[1000, 2000] ice_servers=1 fingerprint=Sha256 candidates=1").await;
-
-  let jingle = accept.get_child("jingle", ns::JINGLE).unwrap();
-  assert_eq!(jingle.attr("sid"), Some("sid-1"));
-  assert_eq!(jingle.children().filter(|child| child.name() == "content").count(), 2);
 }
 
 #[tokio::test]
@@ -538,18 +508,6 @@ async fn replace_transport(harness: &mut Harness, bridge: &str) {
 }
 
 #[tokio::test]
-async fn after_a_transport_replace_the_focus_hears_of_the_new_bridge_session() {
-  let mut harness = Harness::join().await;
-  replace_transport(&mut harness, "bridge-2").await;
-
-  // The focus only takes a restart or an ICE failure that names the bridge session it has now.
-  (harness.media.hooks.session_failed)(2, SessionFailure::Ice);
-  let info = text(harness.server.jingle("session-info").await.get_child("jingle", ns::JINGLE).unwrap());
-  assert!(info.contains("<bridge-session xmlns='http://jitsi.org/protocol/focus' id='bridge-2'/>"), "{info}");
-  assert!(!info.contains("bridge-1"), "{info}");
-}
-
-#[tokio::test]
 async fn a_restart_after_a_transport_replace_names_the_new_bridge_session() {
   let mut harness = Harness::join().await;
   replace_transport(&mut harness, "bridge-2").await;
@@ -655,16 +613,3 @@ async fn a_refusal_that_comes_after_the_new_session_does_not_end_the_conference(
   assert!(!harness.events.all().iter().any(|event| event.starts_with("left")), "{:?}", harness.events.all());
 }
 
-#[tokio::test]
-async fn a_refused_ice_failure_report_leaves_the_new_session_to_come() {
-  let mut harness = Harness::join().await;
-  harness.record_events().await;
-  (harness.media.hooks.session_failed)(1, SessionFailure::Ice);
-  let info = harness.server.jingle("session-info").await;
-  // The focus' rate limit is for restarts, not for this.
-  harness.server.answer_error(&info, "resource-constraint", "rate-limited").await;
-  tokio::time::sleep(Duration::from_millis(100)).await;
-  assert!(!harness.events.all().iter().any(|event| event.starts_with("left")), "{:?}", harness.events.all());
-  harness.server.offer_session("initiate-2", &offer_with("sid-2", &[("bob", 2000)])).await;
-  harness.media.wait_for_log("session 2: start sid=sid-2 sources=[1000, 2000] ice_servers=1 fingerprint=Sha256 candidates=1").await;
-}

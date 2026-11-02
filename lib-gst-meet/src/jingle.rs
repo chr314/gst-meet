@@ -518,17 +518,6 @@ fn bridge_session_element(id: Option<&str>, restart: Option<bool>) -> Element {
   element.build()
 }
 
-/// Tells the focus that ICE failed, with the bridge session it failed for; Jicofo then starts a new session.
-pub(crate) fn ice_failed(session: &SessionRef) -> Jingle {
-  let mut jingle = Jingle::new(Action::SessionInfo, SessionId(session.sid.clone()));
-  jingle.initiator = session.initiator.clone();
-  jingle.other = vec![Element::builder("ice-state", JITSI_FOCUS).append("failed").build()];
-  if let Some(id) = &session.bridge_session_id {
-    jingle.other.push(bridge_session_element(Some(id), None));
-  }
-  jingle
-}
-
 /// Ends the session. `restart` asks the focus for a new one.
 pub(crate) fn session_terminate(session: &SessionRef, reason: Reason, text: Option<&str>, restart: bool) -> Jingle {
   let mut jingle = Jingle::new(Action::SessionTerminate, SessionId(session.sid.clone())).set_reason(ReasonElement {
@@ -798,18 +787,6 @@ mod tests {
     assert_eq!(offer.content_names, prior.content_names);
     assert!(offer.sources.is_empty());
     assert_eq!(offer.bridge_session_id.as_deref(), Some("bridge-1"));
-  }
-
-  #[test]
-  fn session_info_for_a_failed_ice_names_the_bridge_session() {
-    let offer = parse_with(vp8(), &session_initiate("1", &Offer::default())).unwrap();
-    let element = Element::from(ice_failed(&SessionRef::from(&offer)));
-    assert_eq!(
-      String::from(&element),
-      "<jingle xmlns='urn:xmpp:jingle:1' action='session-info' initiator='focus@auth.meet.example/focus' sid='sid-1'>\
-       <ice-state xmlns='http://jitsi.org/protocol/focus'>failed</ice-state>\
-       <bridge-session xmlns='http://jitsi.org/protocol/focus' id='bridge-1'/></jingle>"
-    );
   }
 
   #[test]
