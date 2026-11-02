@@ -193,6 +193,31 @@ async fn muting_sends_the_presence_without_the_muc_extension() {
 }
 
 #[tokio::test]
+async fn presence_elements_go_out_in_this_and_later_presences() {
+  let mut harness = Harness::join().await;
+  let session_id =
+    |presence: &Element| presence.get_child("session_id", ns::DEFAULT_NS).map(|element| element.text());
+  harness
+    .conference
+    .set_presence_element(Element::builder("session_id", ns::DEFAULT_NS).append("s1").build())
+    .await
+    .unwrap();
+  let presence = harness.server.presence().await;
+  assert!(!presence.has_child("x", ns::MUC), "{presence:?}");
+  assert_eq!(session_id(&presence).as_deref(), Some("s1"));
+
+  harness.conference.set_muted(crate::MediaType::Audio, true).await.unwrap();
+  assert_eq!(session_id(&harness.server.presence().await).as_deref(), Some("s1"));
+
+  harness
+    .conference
+    .remove_presence_element("session_id", ns::DEFAULT_NS)
+    .await
+    .unwrap();
+  assert_eq!(session_id(&harness.server.presence().await), None);
+}
+
+#[tokio::test]
 async fn a_presence_of_an_unknown_participant_leaving_is_ignored() {
   let harness = Harness::join().await;
   harness.record_events().await;

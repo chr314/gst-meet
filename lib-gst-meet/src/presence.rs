@@ -1,3 +1,4 @@
+use anyhow::{bail, Result};
 use minidom::Element;
 use xmpp_parsers::{muc::Muc, nick::Nick, ns};
 
@@ -13,6 +14,8 @@ pub(crate) struct PresenceState {
   extra_features: Vec<String>,
   audio_muted: bool,
   video_muted: bool,
+  /// Elements the application put in our presence, in the order they were first added.
+  extensions: Vec<Element>,
 }
 
 impl PresenceState {
@@ -31,6 +34,7 @@ impl PresenceState {
       extra_features,
       audio_muted: false,
       video_muted: false,
+      extensions: vec![],
     }
   }
 
@@ -52,9 +56,44 @@ impl PresenceState {
     .to_string()
   }
 
+  /// Puts `element` in our presence, in place of the one with the same name and namespace if there is one. Returns
+  /// whether the presence changed. The elements this state writes itself cannot be replaced.
+  pub(crate) fn set_extension(&mut self, element: Element) -> Result<bool> {
+    let same = |other: &Element| other.name() == element.name() && other.ns() == element.ns();
+    if self.own_payloads(true).iter().any(same) {
+      bail!("<{}> in {} is part of the presence the library writes", element.name(), element.ns());
+    }
+    match self.extensions.iter_mut().find(|existing| same(existing)) {
+      Some(existing) if *existing == element => Ok(false),
+      Some(existing) => {
+        *existing = element;
+        Ok(true)
+      },
+      None => {
+        self.extensions.push(element);
+        Ok(true)
+      },
+    }
+  }
+
+  /// Takes the element with this name and namespace out of our presence. Returns whether there was one.
+  pub(crate) fn remove_extension(&mut self, name: &str, namespace: &str) -> bool {
+    let before = self.extensions.len();
+    self
+      .extensions
+      .retain(|element| !(element.name() == name && element.ns() == namespace));
+    self.extensions.len() != before
+  }
+
   /// Only the joining presence (`initial`) asks for the MUC extension: the room answers it with the occupants it has,
   /// and Prosody sends them all again if a later presence asks again.
   pub(crate) fn payloads(&self, initial: bool) -> Vec<Element> {
+    let mut payloads = self.own_payloads(initial);
+    payloads.extend(self.extensions.iter().cloned());
+    payloads
+  }
+
+  fn own_payloads(&self, initial: bool) -> Vec<Element> {
     let mut payloads = vec![];
     if initial {
       payloads.push(Muc::new().into());
@@ -157,6 +196,66 @@ mod tests {
     let mut state = state();
     state.extra_features.clear();
     assert!(!state.payloads(false).iter().any(|payload| payload.name() == "features"));
+  }
+
+  fn plain_element(name: &str, value: &str) -> Element {
+    Element::builder(name, ns::DEFAULT_NS).append(value).build()
+  }
+
+  #[test]
+  fn extensions_follow_the_presence_the_library_writes() {
+    let mut state = state();
+    assert!(state.set_extension(plain_element("session_id", "s1")).unwrap());
+    assert!(state.set_extension(plain_element("mode", "file")).unwrap());
+
+    let payloads = state.payloads(false);
+    let names: Vec<_> = payloads.iter().rev().take(2).map(|payload| payload.name()).collect();
+    assert_eq!(names, ["mode", "session_id"]);
+    assert_eq!(text_of(&payloads, "session_id"), "s1");
+    assert_eq!(text_of(&state.payloads(true), "session_id"), "s1");
+  }
+
+  #[test]
+  fn an_extension_replaces_the_one_with_its_name_and_namespace() {
+    let mut state = state();
+    assert!(state.set_extension(plain_element("session_id", "s1")).unwrap());
+    assert!(!state.set_extension(plain_element("session_id", "s1")).unwrap());
+    assert!(state.set_extension(plain_element("session_id", "s2")).unwrap());
+    assert!(state
+      .set_extension(Element::builder("session_id", "urn:example").append("s3").build())
+      .unwrap());
+
+    let payloads = state.payloads(false);
+    let session_ids: Vec<_> = payloads
+      .iter()
+      .filter(|payload| payload.name() == "session_id")
+      .map(|payload| (payload.ns(), payload.text()))
+      .collect();
+    assert_eq!(
+      session_ids,
+      [
+        (ns::DEFAULT_NS.to_owned(), "s2".to_owned()),
+        ("urn:example".to_owned(), "s3".to_owned())
+      ]
+    );
+  }
+
+  #[test]
+  fn removing_an_extension() {
+    let mut state = state();
+    state.set_extension(plain_element("session_id", "s1")).unwrap();
+    assert!(!state.remove_extension("session_id", "urn:example"));
+    assert!(state.remove_extension("session_id", ns::DEFAULT_NS));
+    assert!(!state.remove_extension("session_id", ns::DEFAULT_NS));
+    assert!(!state.payloads(false).iter().any(|payload| payload.name() == "session_id"));
+  }
+
+  #[test]
+  fn the_elements_the_library_writes_cannot_be_replaced() {
+    let mut state = state();
+    assert!(state.set_extension(plain_element("audiomuted", "true")).is_err());
+    assert!(state.set_extension(Muc::new().into()).is_err());
+    assert_eq!(text_of(&state.payloads(false), "audiomuted"), "false");
   }
 
   #[test]

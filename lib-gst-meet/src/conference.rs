@@ -289,6 +289,33 @@ impl JitsiConference {
     self.shared.send_presence_payloads(payloads).await
   }
 
+  /// Puts `element` in the presence the other participants see, in place of the one with the same name and namespace
+  /// if there is one, like ljm's `addOrReplaceInPresence`. It stays in every presence we send from then on. The
+  /// elements the library writes itself (the nick, the codecs, the mute state, ...) are refused.
+  pub async fn set_presence_element(&self, element: Element) -> Result<()> {
+    let payloads = {
+      let mut state = self.shared.lock();
+      if !state.presence.set_extension(element)? || !state.in_room {
+        return Ok(());
+      }
+      state.presence.payloads(false)
+    };
+    self.shared.send_presence_payloads(payloads).await
+  }
+
+  /// Takes the element with this name and namespace out of our presence, if [`Self::set_presence_element`] put one
+  /// there.
+  pub async fn remove_presence_element(&self, name: &str, namespace: &str) -> Result<()> {
+    let payloads = {
+      let mut state = self.shared.lock();
+      if !state.presence.remove_extension(name, namespace) || !state.in_room {
+        return Ok(());
+      }
+      state.presence.payloads(false)
+    };
+    self.shared.send_presence_payloads(payloads).await
+  }
+
   /// The pipeline of the conference, which exists from the start and goes on after the media sessions that come
   /// and go in it. It is `Playing` from the first media session on.
   pub fn pipeline(&self) -> gstreamer::Pipeline {
